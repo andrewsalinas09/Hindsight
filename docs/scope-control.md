@@ -50,10 +50,10 @@ def main():
 
 These two forms are interchangeable. The decorator is sugar for the context manager applied to the function body. By default, this records the decorated/wrapped scope and everything it transitively calls — equivalent to `depth=None`.
 
-To limit how far recording recurses, pass a `depth` argument:
+To limit how far recording recurses into callees, pass a `depth` argument:
 
 ```python
-@hindsight.record(depth=0)   # just this function, no callees
+@hindsight.record(depth=0)   # this function fully, no callees
 def process_request(req):
     ...
 
@@ -66,7 +66,9 @@ def process_request(req):
     ...
 ```
 
-Depth is counted in call levels from the recorded scope. A function call from inside a recorded scope increases depth by one; returning decreases it. When depth exceeds the configured limit, recording suspends until execution returns to within the limit. Excluded functions don't count against the depth budget — they're skipped entirely, not consumed.
+Depth controls recursion into nested function calls, not the granularity of recording within a recorded scope. **A function that's in scope is always fully recorded** — every line, every variable, every branch, every call event. Depth only governs whether we follow into the callees' interiors. So `depth=0` records the decorated function completely, including all its internal logic, but treats every function it calls as a black box: the call site sees the arguments and return value, but the callee's body is not captured. `depth=1` adds one level of recursion, capturing the immediate callees' interiors as well. `depth=None` follows the call tree wherever it goes.
+
+Depth is counted from the recorded scope. A function call from inside a recorded scope increases depth by one; returning decreases it. When depth would exceed the configured limit, the about-to-be-called function is treated as a black box for that call. Excluded functions don't count against the depth budget — they're skipped entirely, not consumed.
 
 ### Layer 2: include and exclude patterns
 
