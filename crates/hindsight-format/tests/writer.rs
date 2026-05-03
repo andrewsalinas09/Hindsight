@@ -101,7 +101,11 @@ fn build_worked_example() -> Vec<u8> {
     .unwrap();
 
     let mut out = Vec::new();
-    w.finish(&mut out).unwrap();
+    // These tests pin the on-disk layout of everything up to and including
+    // the event block; they intentionally use `write_unfinalized` so the
+    // file ends at the event block (no final summary, no checkpoint index,
+    // no footer). The finalized-write path is exercised in tests/reader.rs.
+    w.write_unfinalized(&mut out).unwrap();
     out
 }
 

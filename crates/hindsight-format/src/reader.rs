@@ -3,14 +3,14 @@
 //! Buffered reader that parses a `.hindsight` trace file produced by
 //! [`crate::TraceWriter`].
 //!
-//! Scope mirrors the writer's current scope: file header, initial metadata
-//! block, source bundle, initial string and value tables, and a single event
-//! block holding FUNCTION_ENTRY, FUNCTION_EXIT, FRAME_SNAPSHOT, and
-//! LINE_DELTA events. Footer, final summary, checkpoints, table updates,
-//! table snapshots, and other event types are out of scope and surface as
-//! [`FormatError::UnsupportedBlockTag`] / [`FormatError::UnsupportedEventTag`]
-//! / [`FormatError::TrailingBytesAfterEventBlock`] depending on what the
-//! reader hits.
+//! Scope: file header, initial metadata block, source bundle, initial string
+//! and value tables, a single event block carrying any of the nine v0.2
+//! event types, and (when finalized) a final summary block, an empty
+//! checkpoint index, and a footer. Checkpoints (block tag 0x02), table
+//! updates (0x03), and table snapshots (0x04) are out of scope and surface
+//! as [`FormatError::UnsupportedBlockTag`]; non-empty checkpoint indexes
+//! are out of scope and surface as [`FormatError::SectionLengthMismatch`]
+//! at parse time.
 //!
 //! ## Section length conventions (resolved against the writer)
 //!
@@ -19,10 +19,9 @@
 //!
 //! - **Metadata block.** `length` u32 LE *includes* the format-tag byte; the
 //!   payload is `length - 1` bytes.
-//! - **Source bundle / string table / value table.** `length` u32 LE is the
-//!   size of everything *after* the length field — i.e., file_count + entries
-//!   for the bundle, count + strings for the string table, count + entries
-//!   for the value table. Length does not include itself.
+//! - **Source bundle / string table / value table / checkpoint index.**
+//!   `length` u32 LE is the size of everything *after* the length field,
+//!   not counting the length field itself.
 //! - **Event block.** `block_length` u32 LE is the size of everything after
 //!   itself: `block_tag` (1) + `header_length` varint + header content +
 //!   compressed payload. The inner `header_length` varint is the size of the
@@ -32,6 +31,9 @@
 //! - **Value table entries.** The `length` varint is just the encoded `data`
 //!   bytes; it does *not* include the type tag, hash kind, hash, or the
 //!   length varint itself.
+//! - **Final summary.** `length` u32 LE is the byte length of the TOML
+//!   payload that follows; there is no inner format-tag byte (unlike the
+//!   initial metadata block).
 //!
 //! ## Spec ambiguities surfaced by this implementation
 //!
@@ -47,10 +49,15 @@
 //!   the table. The writer enforces that on write; the reader enforces it on
 //!   read via [`FormatError::ForwardValueRef`].
 //! - The v0.2 spec says unknown event tags are skipped. This reader instead
-//!   errors on event tags 0x05+ because the current writer doesn't produce
+//!   errors on event tags 0x0A+ because the current writer doesn't produce
 //!   them; silently skipping them in v0 would mask writer bugs. Forward
-//!   compatibility (skip on unknown) can be reintroduced once additional
-//!   event types are actually emitted.
+//!   compatibility (skip on unknown) can be reintroduced once event types
+//!   beyond 0x09 actually exist.
+//! - The v0.2 spec final-summary diagram is silent on whether the block
+//!   carries a format-tag byte (TOML/JSON discriminator) the way the initial
+//!   metadata block does. This reader treats the final summary as raw
+//!   length-prefixed TOML with no inner tag — see TODO(v0.3) in
+//!   `docs/trace-format.md`.
 
 use std::io::Read;
 
@@ -58,12 +65,14 @@ use crate::byte_reader::ByteReader;
 use crate::decoding::decode_value;
 use crate::error::{FormatError, Result};
 use crate::event::{
-    Argument, Change, Event, FrameSnapshot, FunctionEntry, FunctionExit, LineDelta, Local,
+    Argument, BoundaryType, BranchResult, Change, Event, ExceptionRaised, FrameSnapshot,
+    FrameSwitch, FrameSwitchReason, FunctionEntry, FunctionExit, Kwarg, LineDelta, Local, Note,
+    ScopeBoundary,
 };
 use crate::value::{HashKind, StringId, Value, ValueId, ValueTag};
 use crate::writer::{
-    BLOCK_TAG_EVENT, FILE_MAGIC, FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR, FileId, HEADER_LENGTH,
-    METADATA_FORMAT_TAG_TOML,
+    BLOCK_TAG_EVENT, FILE_MAGIC, FOOTER_LENGTH, FOOTER_MAGIC, FORMAT_VERSION_MAJOR,
+    FORMAT_VERSION_MINOR, FileId, HEADER_LENGTH, METADATA_FORMAT_TAG_TOML,
 };
 
 /// Parsed file header. See `docs/trace-format.md` §"File header".
@@ -75,10 +84,11 @@ pub struct Header {
     pub header_length: u32,
     pub trace_uuid: [u8; 16],
     pub recording_start_ns: u64,
-    /// Zero if the file was not finalized cleanly (current writer always
-    /// produces zero — finalization isn't implemented yet).
-    pub recording_end_ns: u64,
     /// Zero if the file was not finalized cleanly.
+    pub recording_end_ns: u64,
+    /// Zero if the file was not finalized cleanly. When non-zero, the reader
+    /// parses through to the footer and exposes the final summary, the
+    /// checkpoint index, and the footer.
     pub footer_offset: u64,
 }
 
@@ -119,12 +129,44 @@ pub struct EventBlockInfo {
     pub value_table_size_after: u32,
 }
 
+/// Parsed final summary block. The TOML payload is returned verbatim, mirror
+/// of [`MetadataBlock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalSummary {
+    pub payload: String,
+}
+
+/// One entry in the checkpoint index. v0 writers emit zero entries; this
+/// type exists for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointEntry {
+    pub wall_clock_ns: u64,
+    pub event_id: u64,
+    pub file_offset: u64,
+    pub snapshot_offset: u64,
+}
+
+/// Parsed footer. See `docs/trace-format.md` §"Footer".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Footer {
+    pub footer_length: u32,
+    pub checkpoint_index_offset: u64,
+    pub final_summary_offset: u64,
+}
+
 /// Parsed `.hindsight` trace.
 ///
 /// Construct via [`TraceReader::new`] (any `Read` impl) or
 /// [`TraceReader::from_bytes`] (already-loaded slice). Both eagerly parse the
 /// whole file; this matches the writer, which buffers everything before
 /// emitting, and keeps the API simple given the v0.2 single-block shape.
+///
+/// Trailing sections (final summary, checkpoint index, footer) are only
+/// parsed when the file header's `footer_offset` is non-zero. For unfinalized
+/// files (header.footer_offset == 0), the reader stops after the event block
+/// and any bytes after that point are silently ignored — this matches the
+/// spec's crash-recovery semantics ("events read up to the last valid block
+/// are fully usable").
 #[derive(Debug, Clone)]
 pub struct TraceReader {
     header: Header,
@@ -134,6 +176,9 @@ pub struct TraceReader {
     values: Vec<ValueEntry>,
     events: Vec<Event>,
     event_block: EventBlockInfo,
+    final_summary: Option<FinalSummary>,
+    checkpoints: Vec<CheckpointEntry>,
+    footer: Option<Footer>,
 }
 
 impl TraceReader {
@@ -152,9 +197,44 @@ impl TraceReader {
         let values = parse_value_table(&mut br, strings.len())?;
         let (event_block, events) = parse_event_block(&mut br, &source_files, &strings, &values)?;
 
-        if br.remaining() != 0 {
-            return Err(FormatError::TrailingBytesAfterEventBlock(br.remaining()));
-        }
+        let (final_summary, checkpoints, footer) = if header.footer_offset == 0 {
+            // Unfinalized trace: stop here and silently tolerate any trailing
+            // bytes (could be the start of a partial final summary the writer
+            // never got to finish). This matches the spec's crash-recovery
+            // semantics — see the type-level doc comment.
+            (None, Vec::new(), None)
+        } else {
+            let final_summary_offset = br.pos() as u64;
+            let final_summary = parse_final_summary(&mut br)?;
+            let checkpoint_index_offset = br.pos() as u64;
+            let checkpoints = parse_checkpoint_index(&mut br)?;
+            let observed_footer_offset = br.pos() as u64;
+            if observed_footer_offset != header.footer_offset {
+                return Err(FormatError::HeaderFooterOffsetMismatch {
+                    expected: header.footer_offset,
+                    observed: observed_footer_offset,
+                });
+            }
+            let footer = parse_footer(&mut br)?;
+            if footer.final_summary_offset != final_summary_offset {
+                return Err(FormatError::FooterOffsetMismatch {
+                    field: "final_summary_offset",
+                    expected: footer.final_summary_offset,
+                    observed: final_summary_offset,
+                });
+            }
+            if footer.checkpoint_index_offset != checkpoint_index_offset {
+                return Err(FormatError::FooterOffsetMismatch {
+                    field: "checkpoint_index_offset",
+                    expected: footer.checkpoint_index_offset,
+                    observed: checkpoint_index_offset,
+                });
+            }
+            if br.remaining() != 0 {
+                return Err(FormatError::TrailingBytesAfterFinalSection(br.remaining()));
+            }
+            (Some(final_summary), checkpoints, Some(footer))
+        };
 
         Ok(Self {
             header,
@@ -164,6 +244,9 @@ impl TraceReader {
             values,
             events,
             event_block,
+            final_summary,
+            checkpoints,
+            footer,
         })
     }
 
@@ -187,6 +270,24 @@ impl TraceReader {
     }
     pub fn event_block_info(&self) -> &EventBlockInfo {
         &self.event_block
+    }
+    /// Returns `Some` if the file was finalized cleanly (header.footer_offset
+    /// non-zero), otherwise `None`.
+    pub fn final_summary(&self) -> Option<&FinalSummary> {
+        self.final_summary.as_ref()
+    }
+    /// Empty for unfinalized files and for v0 finalized files (no checkpoints
+    /// emitted yet).
+    pub fn checkpoints(&self) -> &[CheckpointEntry] {
+        &self.checkpoints
+    }
+    /// Returns `Some` if the file was finalized cleanly.
+    pub fn footer(&self) -> Option<&Footer> {
+        self.footer.as_ref()
+    }
+    /// Convenience for callers that just want a yes/no on finalization.
+    pub fn is_finalized(&self) -> bool {
+        self.footer.is_some()
     }
 }
 
@@ -609,25 +710,99 @@ fn parse_event(
                 changes,
             })
         }
-        // Strict-mode policy: error on unknown event tags rather than skip
+        0x05 => {
+            let timestamp_delta_ns = br.read_uvarint()?;
+            let line = read_u32_varint(br, "BRANCH_RESULT line")?;
+            let taken_byte = br.read_u8()?;
+            let taken = match taken_byte {
+                0 => false,
+                1 => true,
+                other => return Err(FormatError::InvalidBoolByte(other)),
+            };
+            Event::BranchResult(BranchResult {
+                timestamp_delta_ns,
+                line,
+                taken,
+            })
+        }
+        0x06 => {
+            let timestamp_delta_ns = br.read_uvarint()?;
+            let line = read_u32_varint(br, "EXCEPTION_RAISED line")?;
+            let exception_type = br.read_uvarint()?;
+            let exception_value = br.read_uvarint()?;
+            check_string(strings, exception_type)?;
+            check_value(values, exception_value)?;
+            Event::ExceptionRaised(ExceptionRaised {
+                timestamp_delta_ns,
+                line,
+                exception_type,
+                exception_value,
+            })
+        }
+        0x07 => {
+            let timestamp_delta_ns = br.read_uvarint()?;
+            let line = read_u32_varint(br, "NOTE line")?;
+            let message = br.read_uvarint()?;
+            let kwarg_count = br.read_uvarint()? as usize;
+            let mut kwargs = Vec::with_capacity(kwarg_count);
+            for _ in 0..kwarg_count {
+                let name = br.read_uvarint()?;
+                let value = br.read_uvarint()?;
+                check_string(strings, name)?;
+                check_value(values, value)?;
+                kwargs.push(Kwarg { name, value });
+            }
+            check_string(strings, message)?;
+            Event::Note(Note {
+                timestamp_delta_ns,
+                line,
+                message,
+                kwargs,
+            })
+        }
+        0x08 => {
+            let timestamp_delta_ns = br.read_uvarint()?;
+            let boundary_byte = br.read_u8()?;
+            let boundary_type = BoundaryType::from_u8(boundary_byte)?;
+            let reason = br.read_uvarint()?;
+            check_string(strings, reason)?;
+            Event::ScopeBoundary(ScopeBoundary {
+                timestamp_delta_ns,
+                boundary_type,
+                reason,
+            })
+        }
+        0x09 => {
+            let timestamp_delta_ns = br.read_uvarint()?;
+            let old_frame_id = br.read_uvarint()?;
+            let new_frame_id = br.read_uvarint()?;
+            let reason_byte = br.read_u8()?;
+            let reason = FrameSwitchReason::from_u8(reason_byte)?;
+            Event::FrameSwitch(FrameSwitch {
+                timestamp_delta_ns,
+                old_frame_id,
+                new_frame_id,
+                reason,
+            })
+        }
+        // Strict-mode policy: error on event tags 0x0A+ rather than skip
         // them via the length prefix as the spec describes.
         //
         // The spec's §"Reserved event types" says readers must skip unknown
         // tags using the length prefix — that's the right long-term behavior
-        // for forward compatibility once multiple event types exist. But
-        // today the writer only ever emits 0x01..=0x04, so any other tag is
-        // either:
+        // for forward compatibility once readers and writers can disagree
+        // about which event types exist. Today the writer emits exactly
+        // 0x01..=0x09 and this reader supports the same set, so anything else
+        // is either:
         //   - a writer bug (a new event type half-implemented),
         //   - corruption that flipped a tag byte, or
         //   - a third-party recorder running ahead of this reader.
-        // All three are worth surfacing loudly during v0; skip-with-warning
-        // would mask them.
+        // All three are worth surfacing loudly; skip-with-warning would mask
+        // them.
         //
-        // Flip to spec-compliant skip behavior once the writer supports the
-        // full event-type set (BRANCH_RESULT, EXCEPTION_RAISED, NOTE,
-        // SCOPE_BOUNDARY, FRAME_SWITCH); at that point this turns into a
-        // forward-compatibility shim and the strictness is no longer paying
-        // for itself.
+        // Flip to spec-compliant skip behavior once we cut a release whose
+        // writer can stay behind a reader (i.e., once forward-compat between
+        // versions is a real scenario).
         _ => return Err(FormatError::UnsupportedEventTag(tag_byte)),
     };
 
@@ -640,6 +815,75 @@ fn parse_event(
         });
     }
     Ok(event)
+}
+
+fn parse_final_summary(br: &mut ByteReader) -> Result<FinalSummary> {
+    let length = br.read_u32_le()? as usize;
+    let payload_bytes = br.take(length)?;
+    let payload = std::str::from_utf8(payload_bytes)
+        .map_err(|_| FormatError::InvalidUtf8 {
+            field: "final summary payload",
+        })?
+        .to_owned();
+    Ok(FinalSummary { payload })
+}
+
+fn parse_checkpoint_index(br: &mut ByteReader) -> Result<Vec<CheckpointEntry>> {
+    let length = br.read_u32_le()? as usize;
+    let start = br.pos();
+    let count = br.read_u32_le()? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let wall_clock_ns = br.read_u64_le()?;
+        let event_id = br.read_u64_le()?;
+        let file_offset = br.read_u64_le()?;
+        let snapshot_offset = br.read_u64_le()?;
+        entries.push(CheckpointEntry {
+            wall_clock_ns,
+            event_id,
+            file_offset,
+            snapshot_offset,
+        });
+    }
+    let consumed = br.pos() - start;
+    if consumed != length {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "checkpoint index",
+            expected: length as u64,
+            consumed: consumed as u64,
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_footer(br: &mut ByteReader) -> Result<Footer> {
+    let magic_bytes = br.take(8)?;
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(magic_bytes);
+    if magic != FOOTER_MAGIC {
+        return Err(FormatError::BadFooterMagic {
+            expected: FOOTER_MAGIC,
+            got: magic,
+        });
+    }
+    let footer_length = br.read_u32_le()?;
+    if footer_length != FOOTER_LENGTH {
+        return Err(FormatError::BadFooterLength {
+            expected: FOOTER_LENGTH,
+            got: footer_length,
+        });
+    }
+    let checkpoint_index_offset = br.read_u64_le()?;
+    let final_summary_offset = br.read_u64_le()?;
+    let reserved = br.read_u32_le()?;
+    if reserved != 0 {
+        return Err(FormatError::ReservedFieldNonzero("footer reserved tail"));
+    }
+    Ok(Footer {
+        footer_length,
+        checkpoint_index_offset,
+        final_summary_offset,
+    })
 }
 
 fn read_u32_varint(br: &mut ByteReader, field: &'static str) -> Result<u32> {
@@ -676,7 +920,7 @@ fn check_file(sources: &[SourceFile], id: FileId) -> Result<()> {
 mod tests {
     use super::*;
     use crate::metadata::{Metadata, RecorderInfo, RecordingInfo, ScopeConfig};
-    use crate::writer::TraceWriter;
+    use crate::writer::{Finalization, ScopeResolution, TraceWriter};
 
     fn empty_metadata() -> Metadata {
         Metadata {
@@ -697,18 +941,31 @@ mod tests {
         }
     }
 
-    fn write_minimal_trace() -> Vec<u8> {
+    fn finalize() -> Finalization {
+        Finalization {
+            recording_end_ns: 1_700_001_000,
+            scope_resolution: ScopeResolution::default(),
+        }
+    }
+
+    fn write_minimal_finalized() -> Vec<u8> {
+        TraceWriter::new(empty_metadata())
+            .finish_to_bytes(finalize())
+            .unwrap()
+    }
+
+    fn write_minimal_unfinalized() -> Vec<u8> {
         let w = TraceWriter::new(empty_metadata());
         let mut out = Vec::new();
-        w.finish(&mut out).unwrap();
+        w.write_unfinalized(&mut out).unwrap();
         out
     }
 
     // --- Header parser ---
 
     #[test]
-    fn parse_header_extracts_fields() {
-        let bytes = write_minimal_trace();
+    fn parse_header_extracts_fields_for_unfinalized_trace() {
+        let bytes = write_minimal_unfinalized();
         let mut br = ByteReader::new(&bytes);
         let h = parse_header(&mut br).unwrap();
         assert_eq!(h.format_version_major, FORMAT_VERSION_MAJOR);
@@ -717,14 +974,23 @@ mod tests {
         assert_eq!(h.header_length, HEADER_LENGTH);
         assert_eq!(h.trace_uuid, [0xAB; 16]);
         assert_eq!(h.recording_start_ns, 1_700_000_000);
-        assert_eq!(h.recording_end_ns, 0);
+        assert_eq!(h.recording_end_ns, 0, "unfinalized leaves end zero");
         assert_eq!(h.footer_offset, 0);
         assert_eq!(br.pos(), HEADER_LENGTH as usize);
     }
 
     #[test]
+    fn parse_header_extracts_patched_fields_for_finalized_trace() {
+        let bytes = write_minimal_finalized();
+        let mut br = ByteReader::new(&bytes);
+        let h = parse_header(&mut br).unwrap();
+        assert_eq!(h.recording_end_ns, 1_700_001_000);
+        assert!(h.footer_offset > 0);
+    }
+
+    #[test]
     fn parse_header_rejects_bad_magic() {
-        let mut bytes = write_minimal_trace();
+        let mut bytes = write_minimal_unfinalized();
         bytes[0] = b'X';
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
@@ -735,7 +1001,7 @@ mod tests {
 
     #[test]
     fn parse_header_rejects_unsupported_version() {
-        let mut bytes = write_minimal_trace();
+        let mut bytes = write_minimal_unfinalized();
         bytes[8] = 1; // major
         bytes[9] = 0; // minor
         let mut br = ByteReader::new(&bytes);
@@ -747,7 +1013,7 @@ mod tests {
 
     #[test]
     fn parse_header_rejects_nonzero_flags() {
-        let mut bytes = write_minimal_trace();
+        let mut bytes = write_minimal_unfinalized();
         bytes[10] = 0x01;
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
@@ -758,8 +1024,7 @@ mod tests {
 
     #[test]
     fn parse_header_rejects_bad_header_length() {
-        let mut bytes = write_minimal_trace();
-        // header_length lives at offset 12..16
+        let mut bytes = write_minimal_unfinalized();
         bytes[12..16].copy_from_slice(&128u32.to_le_bytes());
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
@@ -773,8 +1038,7 @@ mod tests {
 
     #[test]
     fn parse_header_rejects_nonzero_reserved_tail() {
-        let mut bytes = write_minimal_trace();
-        // Reserved tail lives at offset 56..64.
+        let mut bytes = write_minimal_unfinalized();
         bytes[56] = 1;
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
@@ -787,7 +1051,6 @@ mod tests {
     fn parse_header_truncated_input_errors() {
         let bytes = vec![0u8; 10];
         let mut br = ByteReader::new(&bytes);
-        // 10 bytes is enough for the magic but not the rest.
         assert!(parse_header(&mut br).is_err());
     }
 
@@ -795,7 +1058,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_returns_raw_toml() {
-        let bytes = write_minimal_trace();
+        let bytes = write_minimal_unfinalized();
         let mut br = ByteReader::new(&bytes);
         parse_header(&mut br).unwrap();
         let m = parse_metadata_block(&mut br).unwrap();
@@ -806,7 +1069,6 @@ mod tests {
 
     #[test]
     fn parse_metadata_rejects_unknown_format_tag() {
-        // Build a bogus metadata block: length=1, format_tag=0x99, no payload.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.push(0x99);
@@ -833,10 +1095,9 @@ mod tests {
     fn parse_source_bundle_round_trips_one_file() {
         let mut w = TraceWriter::new(empty_metadata());
         w.add_source_file("hi.py", b"print('hi')\n".to_vec());
-        let mut out = Vec::new();
-        w.finish(&mut out).unwrap();
+        let bytes = w.finish_to_bytes(finalize()).unwrap();
 
-        let mut br = ByteReader::new(&out);
+        let mut br = ByteReader::new(&bytes);
         parse_header(&mut br).unwrap();
         parse_metadata_block(&mut br).unwrap();
         let files = parse_source_bundle(&mut br).unwrap();
@@ -851,8 +1112,6 @@ mod tests {
 
     #[test]
     fn parse_source_bundle_detects_hash_mismatch() {
-        // Build a bogus source bundle by hand: file with right hash for content
-        // "abc", but body actually contains "abd".
         let real_content = b"abd";
         let lying_hash = *blake3::hash(b"abc").as_bytes();
         let path = b"x.py";
@@ -866,7 +1125,7 @@ mod tests {
         entries.extend_from_slice(real_content);
 
         let mut body = Vec::new();
-        body.extend_from_slice(&1u32.to_le_bytes()); // file_count
+        body.extend_from_slice(&1u32.to_le_bytes());
         body.extend_from_slice(&entries);
 
         let mut bytes = Vec::new();
@@ -887,10 +1146,9 @@ mod tests {
         let mut w = TraceWriter::new(empty_metadata());
         w.intern_string("foo");
         w.intern_string("bar");
-        let mut out = Vec::new();
-        w.finish(&mut out).unwrap();
+        let bytes = w.finish_to_bytes(finalize()).unwrap();
 
-        let mut br = ByteReader::new(&out);
+        let mut br = ByteReader::new(&bytes);
         parse_header(&mut br).unwrap();
         parse_metadata_block(&mut br).unwrap();
         parse_source_bundle(&mut br).unwrap();
@@ -900,12 +1158,11 @@ mod tests {
 
     #[test]
     fn parse_string_table_rejects_invalid_utf8() {
-        // length = 4 (count u32) + 1 (varint len) + 1 (one byte) = 6
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&6u32.to_le_bytes()); // section length
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
-        bytes.push(1); // length varint
-        bytes.push(0xFF); // not valid utf-8 alone
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(1);
+        bytes.push(0xFF);
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
             parse_string_table(&mut br),
@@ -915,13 +1172,10 @@ mod tests {
 
     #[test]
     fn parse_string_table_section_length_mismatch_is_caught() {
-        // declared length 100 but body is just 4 bytes (count=0).
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&100u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         let mut br = ByteReader::new(&bytes);
-        // Will fail because we only declared 4 bytes of body but section length
-        // says 100; the reader hits Truncated trying to fill the gap.
         assert!(parse_string_table(&mut br).is_err());
     }
 
@@ -929,7 +1183,7 @@ mod tests {
 
     #[test]
     fn parse_value_table_includes_reserved_indices() {
-        let bytes = write_minimal_trace();
+        let bytes = write_minimal_unfinalized();
         let mut br = ByteReader::new(&bytes);
         parse_header(&mut br).unwrap();
         parse_metadata_block(&mut br).unwrap();
@@ -944,11 +1198,10 @@ mod tests {
 
     #[test]
     fn parse_value_table_rejects_invalid_tag() {
-        // length = 4 (count) + 1 (tag) = 5
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&5u32.to_le_bytes()); // section length
-        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
-        bytes.push(0x55); // invalid tag
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0x55);
         let mut br = ByteReader::new(&bytes);
         assert!(matches!(
             parse_value_table(&mut br, 0),
@@ -958,13 +1211,11 @@ mod tests {
 
     #[test]
     fn parse_value_table_rejects_invalid_hash_kind() {
-        // section: count=1, tag=None(0x00), hash_kind=0x99, hash=16 zero bytes,
-        // length varint=0
         let mut entry = Vec::new();
-        entry.push(0x00); // None tag
-        entry.push(0x99); // bogus hash kind
-        entry.extend_from_slice(&[0u8; 16]); // hash
-        entry.push(0); // length=0
+        entry.push(0x00);
+        entry.push(0x99);
+        entry.extend_from_slice(&[0u8; 16]);
+        entry.push(0);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&((4 + entry.len()) as u32).to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
@@ -978,12 +1229,10 @@ mod tests {
 
     #[test]
     fn parse_value_table_rejects_forward_value_ref() {
-        // count=1, single List entry referencing value id 5 (out of range).
         let mut entry = Vec::new();
         entry.push(ValueTag::ListOrTuple as u8);
         entry.push(HashKind::Content as u8);
         entry.extend_from_slice(&[0u8; 16]);
-        // data: count=1 varint, then id=5 varint
         let data = [0x01u8, 0x05];
         entry.push(data.len() as u8);
         entry.extend_from_slice(&data);
@@ -1003,7 +1252,7 @@ mod tests {
 
     #[test]
     fn parse_event_block_returns_zero_events_for_minimal_trace() {
-        let bytes = write_minimal_trace();
+        let bytes = write_minimal_unfinalized();
         let mut br = ByteReader::new(&bytes);
         parse_header(&mut br).unwrap();
         parse_metadata_block(&mut br).unwrap();
@@ -1020,8 +1269,9 @@ mod tests {
 
     #[test]
     fn parse_event_block_detects_checksum_mismatch() {
-        let mut bytes = write_minimal_trace();
-        // Corrupt the last byte of the file (within the compressed payload).
+        // Use the unfinalized trace so the last byte of the file IS in the
+        // compressed payload (finalized files end in the footer).
+        let mut bytes = write_minimal_unfinalized();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         let mut br = ByteReader::new(&bytes);
@@ -1036,8 +1286,7 @@ mod tests {
 
     #[test]
     fn parse_event_block_rejects_non_event_block_tag() {
-        // Build a bogus event block with tag 0x02 (checkpoint) — out of scope.
-        let body = [0x02u8, 0x01, 0x00]; // tag, header_length=1, header_byte (won't actually parse)
+        let body = [0x02u8, 0x01, 0x00];
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&body);
@@ -1050,22 +1299,116 @@ mod tests {
     }
 
     #[test]
-    fn from_bytes_full_pipeline_for_minimal_trace_works() {
-        let bytes = write_minimal_trace();
+    fn from_bytes_full_pipeline_for_unfinalized_minimal_trace_works() {
+        let bytes = write_minimal_unfinalized();
         let r = TraceReader::from_bytes(&bytes).unwrap();
         assert_eq!(r.header().trace_uuid, [0xAB; 16]);
         assert_eq!(r.events().len(), 0);
         assert!(r.source_files().is_empty());
         assert_eq!(r.values().len(), 2);
+        assert!(r.final_summary().is_none());
+        assert!(r.footer().is_none());
+        assert!(r.checkpoints().is_empty());
+        assert!(!r.is_finalized());
     }
 
     #[test]
-    fn from_bytes_rejects_trailing_garbage() {
-        let mut bytes = write_minimal_trace();
+    fn from_bytes_full_pipeline_for_finalized_minimal_trace_works() {
+        let bytes = write_minimal_finalized();
+        let r = TraceReader::from_bytes(&bytes).unwrap();
+        assert!(r.final_summary().is_some());
+        assert!(r.footer().is_some());
+        assert!(r.checkpoints().is_empty());
+        assert!(r.is_finalized());
+        let summary = r.final_summary().unwrap();
+        assert!(summary.payload.contains("[final]"));
+        assert!(summary.payload.contains("clean_shutdown = true"));
+    }
+
+    #[test]
+    fn unfinalized_trace_with_trailing_garbage_is_tolerated() {
+        let mut bytes = write_minimal_unfinalized();
+        bytes.extend_from_slice(b"garbage that the writer never wrote");
+        // Header.footer_offset is zero so the reader stops after the event
+        // block and ignores the rest. Per the spec's crash-recovery
+        // semantics, an unfinalized file's trailing bytes are discarded.
+        let r = TraceReader::from_bytes(&bytes).unwrap();
+        assert!(!r.is_finalized());
+    }
+
+    #[test]
+    fn finalized_trace_with_trailing_garbage_errors() {
+        let mut bytes = write_minimal_finalized();
         bytes.push(0xAB);
         assert!(matches!(
             TraceReader::from_bytes(&bytes),
-            Err(FormatError::TrailingBytesAfterEventBlock(1))
+            Err(FormatError::TrailingBytesAfterFinalSection(1))
         ));
+    }
+
+    #[test]
+    fn footer_round_trips_offsets() {
+        let bytes = write_minimal_finalized();
+        let r = TraceReader::from_bytes(&bytes).unwrap();
+        let footer = r.footer().unwrap();
+        assert_eq!(footer.footer_length, FOOTER_LENGTH);
+        assert!(footer.final_summary_offset < footer.checkpoint_index_offset);
+        assert!(footer.checkpoint_index_offset < r.header().footer_offset);
+    }
+
+    #[test]
+    fn parse_footer_rejects_bad_magic() {
+        let mut bad_footer = [0u8; 32];
+        bad_footer[0..8].copy_from_slice(b"BADMAGIC");
+        bad_footer[8..12].copy_from_slice(&FOOTER_LENGTH.to_le_bytes());
+        let mut br = ByteReader::new(&bad_footer);
+        assert!(matches!(
+            parse_footer(&mut br),
+            Err(FormatError::BadFooterMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_footer_rejects_bad_length() {
+        let mut footer = [0u8; 32];
+        footer[0..8].copy_from_slice(&FOOTER_MAGIC);
+        footer[8..12].copy_from_slice(&64u32.to_le_bytes()); // wrong length
+        let mut br = ByteReader::new(&footer);
+        assert!(matches!(
+            parse_footer(&mut br),
+            Err(FormatError::BadFooterLength {
+                expected: 32,
+                got: 64
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_checkpoint_index_empty() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // section length
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // count = 0
+        let mut br = ByteReader::new(&bytes);
+        let entries = parse_checkpoint_index(&mut br).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_checkpoint_index_one_entry() {
+        let mut bytes = Vec::new();
+        let body_len = 4 + 32; // count u32 + one 32-byte entry
+        bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&100u64.to_le_bytes()); // wall_clock_ns
+        bytes.extend_from_slice(&7u64.to_le_bytes()); // event_id
+        bytes.extend_from_slice(&200u64.to_le_bytes()); // file_offset
+        bytes.extend_from_slice(&300u64.to_le_bytes()); // snapshot_offset
+        let mut br = ByteReader::new(&bytes);
+        let entries = parse_checkpoint_index(&mut br).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].wall_clock_ns, 100);
+        assert_eq!(entries[0].event_id, 7);
+        assert_eq!(entries[0].file_offset, 200);
+        assert_eq!(entries[0].snapshot_offset, 300);
     }
 }

@@ -2,13 +2,13 @@
 
 //! Event types and event payload encoding.
 //!
-//! The four event types implemented here are FUNCTION_ENTRY, FUNCTION_EXIT,
-//! FRAME_SNAPSHOT, and LINE_DELTA. Other event types in the spec
-//! (BRANCH_RESULT, EXCEPTION_RAISED, NOTE, SCOPE_BOUNDARY, FRAME_SWITCH) are
-//! out of scope for this revision.
+//! All nine v0.2 event types are implemented here:
+//! FUNCTION_ENTRY, FUNCTION_EXIT, FRAME_SNAPSHOT, LINE_DELTA, BRANCH_RESULT,
+//! EXCEPTION_RAISED, NOTE, SCOPE_BOUNDARY, FRAME_SWITCH.
 
 use std::io::{self, Write};
 
+use crate::error::{FormatError, Result};
 use crate::value::{StringId, ValueId};
 use crate::varint::write_uvarint;
 
@@ -22,11 +22,72 @@ pub enum EventTag {
     FunctionExit = 0x02,
     FrameSnapshot = 0x03,
     LineDelta = 0x04,
+    BranchResult = 0x05,
+    ExceptionRaised = 0x06,
+    Note = 0x07,
+    ScopeBoundary = 0x08,
+    FrameSwitch = 0x09,
 }
 
 impl EventTag {
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+}
+
+/// Reason a SCOPE_BOUNDARY event was emitted. See spec §"SCOPE_BOUNDARY".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BoundaryType {
+    EnteredSkip = 0x01,
+    ExitedSkip = 0x02,
+    EnteredExcluded = 0x03,
+    ExitedExcluded = 0x04,
+    EnteredDepthClipped = 0x05,
+    ExitedDepthClipped = 0x06,
+}
+
+impl BoundaryType {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(b: u8) -> Result<Self> {
+        Ok(match b {
+            0x01 => Self::EnteredSkip,
+            0x02 => Self::ExitedSkip,
+            0x03 => Self::EnteredExcluded,
+            0x04 => Self::ExitedExcluded,
+            0x05 => Self::EnteredDepthClipped,
+            0x06 => Self::ExitedDepthClipped,
+            _ => return Err(FormatError::InvalidBoundaryType(b)),
+        })
+    }
+}
+
+/// Reason a FRAME_SWITCH event was emitted. See spec §"FRAME_SWITCH".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameSwitchReason {
+    GeneratorYield = 0x01,
+    GeneratorResume = 0x02,
+    AsyncTaskSwitch = 0x03,
+    ExceptionPartialUnwind = 0x04,
+}
+
+impl FrameSwitchReason {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(b: u8) -> Result<Self> {
+        Ok(match b {
+            0x01 => Self::GeneratorYield,
+            0x02 => Self::GeneratorResume,
+            0x03 => Self::AsyncTaskSwitch,
+            0x04 => Self::ExceptionPartialUnwind,
+            _ => return Err(FormatError::InvalidFrameSwitchReason(b)),
+        })
     }
 }
 
@@ -44,6 +105,13 @@ pub struct Local {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
+    pub name: StringId,
+    pub value: ValueId,
+}
+
+/// One keyword argument attached to a NOTE event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kwarg {
     pub name: StringId,
     pub value: ValueId,
 }
@@ -85,6 +153,56 @@ pub struct LineDelta {
     pub changes: Vec<Change>,
 }
 
+/// A conditional branch was evaluated. See spec §"BRANCH_RESULT".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchResult {
+    pub timestamp_delta_ns: u64,
+    pub line: u32,
+    /// `true` if the branch was taken (the condition evaluated truthy).
+    pub taken: bool,
+}
+
+/// An exception was raised. See spec §"EXCEPTION_RAISED".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptionRaised {
+    pub timestamp_delta_ns: u64,
+    pub line: u32,
+    /// String ID of the qualified exception class name (e.g.,
+    /// `"ValueError"`, `"myapp.errors.NotFound"`).
+    pub exception_type: StringId,
+    /// Value ID of the exception instance summary.
+    pub exception_value: ValueId,
+}
+
+/// A user-emitted `hindsight.note(...)` call. See spec §"NOTE".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Note {
+    pub timestamp_delta_ns: u64,
+    pub line: u32,
+    /// String ID of the note message (the positional argument).
+    pub message: StringId,
+    /// Optional structured key/value pairs from `**kwargs`.
+    pub kwargs: Vec<Kwarg>,
+}
+
+/// Recording crossed a scope boundary. See spec §"SCOPE_BOUNDARY".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeBoundary {
+    pub timestamp_delta_ns: u64,
+    pub boundary_type: BoundaryType,
+    /// String ID of a free-form reason (e.g., `"matched pattern: numpy.*"`).
+    pub reason: StringId,
+}
+
+/// Execution switched to a different frame. See spec §"FRAME_SWITCH".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSwitch {
+    pub timestamp_delta_ns: u64,
+    pub old_frame_id: FrameId,
+    pub new_frame_id: FrameId,
+    pub reason: FrameSwitchReason,
+}
+
 /// One of the event types this writer can emit and the reader can produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -92,6 +210,11 @@ pub enum Event {
     FunctionExit(FunctionExit),
     FrameSnapshot(FrameSnapshot),
     LineDelta(LineDelta),
+    BranchResult(BranchResult),
+    ExceptionRaised(ExceptionRaised),
+    Note(Note),
+    ScopeBoundary(ScopeBoundary),
+    FrameSwitch(FrameSwitch),
 }
 
 impl Event {
@@ -101,6 +224,11 @@ impl Event {
             Event::FunctionExit(_) => EventTag::FunctionExit,
             Event::FrameSnapshot(_) => EventTag::FrameSnapshot,
             Event::LineDelta(_) => EventTag::LineDelta,
+            Event::BranchResult(_) => EventTag::BranchResult,
+            Event::ExceptionRaised(_) => EventTag::ExceptionRaised,
+            Event::Note(_) => EventTag::Note,
+            Event::ScopeBoundary(_) => EventTag::ScopeBoundary,
+            Event::FrameSwitch(_) => EventTag::FrameSwitch,
         }
     }
 }
@@ -159,6 +287,38 @@ fn write_event_payload<W: Write>(w: &mut W, event: &Event) -> io::Result<()> {
                 write_uvarint(w, change.value)?;
             }
         }
+        Event::BranchResult(e) => {
+            write_uvarint(w, e.timestamp_delta_ns)?;
+            write_uvarint(w, u64::from(e.line))?;
+            w.write_all(&[u8::from(e.taken)])?;
+        }
+        Event::ExceptionRaised(e) => {
+            write_uvarint(w, e.timestamp_delta_ns)?;
+            write_uvarint(w, u64::from(e.line))?;
+            write_uvarint(w, e.exception_type)?;
+            write_uvarint(w, e.exception_value)?;
+        }
+        Event::Note(e) => {
+            write_uvarint(w, e.timestamp_delta_ns)?;
+            write_uvarint(w, u64::from(e.line))?;
+            write_uvarint(w, e.message)?;
+            write_uvarint(w, e.kwargs.len() as u64)?;
+            for kw in &e.kwargs {
+                write_uvarint(w, kw.name)?;
+                write_uvarint(w, kw.value)?;
+            }
+        }
+        Event::ScopeBoundary(e) => {
+            write_uvarint(w, e.timestamp_delta_ns)?;
+            w.write_all(&[e.boundary_type.as_u8()])?;
+            write_uvarint(w, e.reason)?;
+        }
+        Event::FrameSwitch(e) => {
+            write_uvarint(w, e.timestamp_delta_ns)?;
+            write_uvarint(w, e.old_frame_id)?;
+            write_uvarint(w, e.new_frame_id)?;
+            w.write_all(&[e.reason.as_u8()])?;
+        }
     }
     Ok(())
 }
@@ -198,5 +358,87 @@ mod tests {
         assert_eq!(bytes[0], 0x04);
         assert_eq!(bytes[1], EventTag::FunctionExit.as_u8());
         assert_eq!(&bytes[2..], &[100u8, 0, 5]);
+    }
+
+    #[test]
+    fn branch_result_layout() {
+        // event_length = 1 (tag) + 2 varints + 1 byte = 4.
+        let bytes = encode(&Event::BranchResult(BranchResult {
+            timestamp_delta_ns: 7,
+            line: 12,
+            taken: true,
+        }));
+        assert_eq!(bytes[0], 4);
+        assert_eq!(bytes[1], EventTag::BranchResult.as_u8());
+        assert_eq!(&bytes[2..], &[7, 12, 1]);
+    }
+
+    #[test]
+    fn scope_boundary_layout() {
+        // event_length = 1 (tag) + ts varint + 1 byte type + reason varint = 4.
+        let bytes = encode(&Event::ScopeBoundary(ScopeBoundary {
+            timestamp_delta_ns: 0,
+            boundary_type: BoundaryType::EnteredSkip,
+            reason: 9,
+        }));
+        assert_eq!(bytes[0], 4);
+        assert_eq!(bytes[1], EventTag::ScopeBoundary.as_u8());
+        assert_eq!(&bytes[2..], &[0, 0x01, 9]);
+    }
+
+    #[test]
+    fn frame_switch_layout() {
+        // event_length = 1 (tag) + 3 varints + 1 byte = 5.
+        let bytes = encode(&Event::FrameSwitch(FrameSwitch {
+            timestamp_delta_ns: 1,
+            old_frame_id: 2,
+            new_frame_id: 3,
+            reason: FrameSwitchReason::AsyncTaskSwitch,
+        }));
+        assert_eq!(bytes[0], 5);
+        assert_eq!(bytes[1], EventTag::FrameSwitch.as_u8());
+        assert_eq!(&bytes[2..], &[1, 2, 3, 0x03]);
+    }
+
+    #[test]
+    fn boundary_type_round_trip() {
+        for bt in [
+            BoundaryType::EnteredSkip,
+            BoundaryType::ExitedSkip,
+            BoundaryType::EnteredExcluded,
+            BoundaryType::ExitedExcluded,
+            BoundaryType::EnteredDepthClipped,
+            BoundaryType::ExitedDepthClipped,
+        ] {
+            assert_eq!(BoundaryType::from_u8(bt.as_u8()).unwrap(), bt);
+        }
+        assert!(matches!(
+            BoundaryType::from_u8(0x00),
+            Err(FormatError::InvalidBoundaryType(0x00))
+        ));
+        assert!(matches!(
+            BoundaryType::from_u8(0x07),
+            Err(FormatError::InvalidBoundaryType(0x07))
+        ));
+    }
+
+    #[test]
+    fn frame_switch_reason_round_trip() {
+        for r in [
+            FrameSwitchReason::GeneratorYield,
+            FrameSwitchReason::GeneratorResume,
+            FrameSwitchReason::AsyncTaskSwitch,
+            FrameSwitchReason::ExceptionPartialUnwind,
+        ] {
+            assert_eq!(FrameSwitchReason::from_u8(r.as_u8()).unwrap(), r);
+        }
+        assert!(matches!(
+            FrameSwitchReason::from_u8(0x00),
+            Err(FormatError::InvalidFrameSwitchReason(0x00))
+        ));
+        assert!(matches!(
+            FrameSwitchReason::from_u8(0x05),
+            Err(FormatError::InvalidFrameSwitchReason(0x05))
+        ));
     }
 }

@@ -85,10 +85,39 @@ pub enum FormatError {
     DecompressedLengthMismatch { expected: u64, got: u64 },
     #[error("zstd decompression failed: {0}")]
     Decompression(String),
-    #[error("trailing bytes after event block: {0} byte(s) left in file")]
-    TrailingBytesAfterEventBlock(usize),
+    /// Bytes left in the file after the last expected section. For
+    /// finalized files (header.footer_offset != 0) the last expected section
+    /// is the footer; for unfinalized files the reader does not enforce an
+    /// end-of-file marker (per the spec's crash-recovery semantics) so this
+    /// error is only emitted on the finalized path.
+    #[error("trailing bytes after final section: {0} byte(s) left in file")]
+    TrailingBytesAfterFinalSection(usize),
     #[error("trailing bytes inside event block payload: {0} byte(s) after the last event")]
     TrailingBytesInEventBlock(usize),
+    /// SCOPE_BOUNDARY event payload's `boundary_type` byte was not one of the
+    /// values defined by the spec.
+    #[error("invalid SCOPE_BOUNDARY boundary type {0:#x}")]
+    InvalidBoundaryType(u8),
+    /// FRAME_SWITCH event payload's `reason` byte was not one of the values
+    /// defined by the spec.
+    #[error("invalid FRAME_SWITCH reason {0:#x}")]
+    InvalidFrameSwitchReason(u8),
+    #[error("bad footer magic: expected {expected:?}, got {got:?}")]
+    BadFooterMagic { expected: [u8; 8], got: [u8; 8] },
+    #[error("bad footer length: expected {expected}, got {got}")]
+    BadFooterLength { expected: u32, got: u32 },
+    /// The footer's `final_summary_offset` or `checkpoint_index_offset` did
+    /// not match where the reader actually parsed those sections.
+    #[error("{field} mismatch: footer says {expected}, reader observed {observed}")]
+    FooterOffsetMismatch {
+        field: &'static str,
+        expected: u64,
+        observed: u64,
+    },
+    /// The header's `footer_offset` did not match where the reader actually
+    /// parsed the footer.
+    #[error("header footer_offset mismatch: header says {expected}, reader observed {observed}")]
+    HeaderFooterOffsetMismatch { expected: u64, observed: u64 },
     /// Event length prefix was zero — at minimum the type tag byte must fit.
     #[error("event with zero length prefix")]
     EmptyEvent,

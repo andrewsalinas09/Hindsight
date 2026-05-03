@@ -372,6 +372,10 @@ The first snapshot in the file is logically the initial string and value tables 
 
 Length-prefixed TOML, written near the end of the file when recording finalizes cleanly. Contains information that's only known after recording completes.
 
+**TODO(v0.3):** unlike the initial metadata block, this section's diagram doesn't show a format-tag byte distinguishing TOML from JSON. The current writer/reader pair treats the section as a u32 length followed by raw TOML bytes — no inner format tag. Either commit to that (final summary is always TOML) or add a parallel format-tag byte so JSON is reachable later. Surfaced by the writer/reader implementation.
+
+**TODO(v0.3):** the `[final.statistics]` example in this section only enumerates a subset of event types (function_entry, line, branch, exception, note). The current writer emits a full per-event-type breakdown — `function_entry_events`, `function_exit_events`, `frame_snapshot_events`, `line_events`, `branch_events`, `exception_events`, `note_events`, `scope_boundary_events`, `frame_switch_events`. Update the example to enumerate all nine, or explicitly mark the spec list as illustrative-only. Surfaced by the writer implementation.
+
 ```toml
 [final]
 clean_shutdown = true
@@ -401,6 +405,8 @@ note_events = 0
 ```
 
 If `clean_shutdown = false` or the final summary is missing entirely, the trace was interrupted. The header's `recording_end` field will be zero in this case. Readers handle this gracefully — events read up to the last valid block are fully usable; the summary just isn't available.
+
+**TODO(v0.3):** the spec doesn't define what `total_blocks` counts. The §"Event blocks" section only describes `0x01..=0x04` block tags, but the final summary, checkpoint index, and footer aren't block-tagged at all — they're standalone sections after the block stream. The current writer counts the final summary as one of the `total_blocks` (so an empty trace finalizes with `total_blocks = 2`: one event block + one summary). Either codify "blocks tagged 0x01-0x04 + the final summary" or scope `total_blocks` strictly to tagged blocks. Surfaced by the writer implementation.
 
 ### Checkpoint index
 
@@ -443,6 +449,8 @@ If no checkpoint index is present (unfinalized trace), readers fall back to scan
 | 28     | 4    | Reserved             | Must be zero in v0.2                     |
 
 If the recording was not finalized cleanly, the footer is absent and the header's `footer_offset` is zero. Readers detecting this case scan from the start of the event blocks; they're slower but the file is still readable.
+
+**TODO(v0.3):** the spec doesn't say whether a sequential reader should validate that the footer's `final_summary_offset` and `checkpoint_index_offset` match where it actually parsed those sections, nor whether the header's `footer_offset` should be validated against where the footer actually begins. The current reader cross-checks both, surfacing `FooterOffsetMismatch` / `HeaderFooterOffsetMismatch` on disagreement, on the theory that mismatches indicate corruption and a sequential reader has those offsets for free. Codify the requirement (or explicitly mark it as optional). Surfaced by the reader implementation.
 
 ## Event types
 

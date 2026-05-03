@@ -3,13 +3,12 @@
 //! Binary trace format reader and writer for Hindsight.
 //!
 //! The format is specified in `docs/trace-format.md` (v0.2). This crate
-//! implements the v0.2 *writer* (file header, initial metadata block, source
-//! bundle, initial string and value tables, one event block holding
-//! FUNCTION_ENTRY, FUNCTION_EXIT, FRAME_SNAPSHOT, and LINE_DELTA events) and
-//! a matching *reader* — see [`TraceReader`]. Footer, final summary,
-//! checkpoints, table updates, table snapshots, and the remaining event
-//! types are not yet implemented; the reader returns clear errors if it
-//! encounters them.
+//! implements a v0.2 writer that produces a fully-finalized file (header,
+//! initial metadata, source bundle, initial string and value tables, one
+//! event block carrying any of the nine v0.2 event types, final summary,
+//! checkpoint index, and footer) and a matching reader that handles both
+//! finalized and unfinalized (interrupted) files. Multi-block streams,
+//! checkpoints, table updates, and table snapshots are not yet implemented.
 
 mod byte_reader;
 mod canonical;
@@ -25,14 +24,18 @@ mod writer;
 
 pub use error::{FormatError, Result};
 pub use event::{
-    Argument, Change, Event, EventTag, FrameId, FrameSnapshot, FunctionEntry, FunctionExit,
-    LineDelta, Local,
+    Argument, BoundaryType, BranchResult, Change, Event, EventTag, ExceptionRaised, FrameId,
+    FrameSnapshot, FrameSwitch, FrameSwitchReason, FunctionEntry, FunctionExit, Kwarg, LineDelta,
+    Local, Note, ScopeBoundary,
 };
 pub use metadata::{Metadata, ProgramInfo, RecorderInfo, RecordingInfo, ScopeConfig};
-pub use reader::{EventBlockInfo, Header, MetadataBlock, SourceFile, TraceReader, ValueEntry};
+pub use reader::{
+    CheckpointEntry, EventBlockInfo, FinalSummary, Footer, Header, MetadataBlock, SourceFile,
+    TraceReader, ValueEntry,
+};
 pub use value::{HashKind, StringId, Value, ValueId, ValueTag};
 pub use writer::{
-    BLOCK_TAG_EVENT, EXCEPTION_UNWIND_VALUE_ID, FILE_MAGIC, FORMAT_VERSION_MAJOR,
-    FORMAT_VERSION_MINOR, FileId, HEADER_LENGTH, METADATA_FORMAT_TAG_TOML, NONE_VALUE_ID,
-    TraceWriter,
+    BLOCK_TAG_EVENT, EXCEPTION_UNWIND_VALUE_ID, ExcludedFunction, FILE_MAGIC, FOOTER_LENGTH,
+    FOOTER_MAGIC, FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR, FileId, Finalization, HEADER_LENGTH,
+    METADATA_FORMAT_TAG_TOML, NONE_VALUE_ID, ScopeResolution, TraceWriter,
 };
