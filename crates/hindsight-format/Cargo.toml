@@ -13,3 +13,4 @@ zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 blake3 = "1"
 thiserror = "2"
+crc32c = "0.6"
