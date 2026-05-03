@@ -109,4 +109,20 @@ mod tests {
         // List of value IDs [3, 5]: count varint + two id varints.
         assert_eq!(encode(&Value::List(vec![3, 5])), vec![0x02, 0x03, 0x05]);
     }
+
+    #[test]
+    fn list_handles_multi_byte_varint_ids() {
+        // 300 -> two-byte varint (0xAC, 0x02); 16384 -> three-byte (0x80, 0x80, 0x01).
+        // count = 2 -> single byte 0x02. Catches per-element loop bugs that a
+        // single-byte-id test would miss.
+        let bytes = encode(&Value::List(vec![300, 16384]));
+        assert_eq!(bytes, vec![0x02, 0xAC, 0x02, 0x80, 0x80, 0x01]);
+    }
+
+    #[test]
+    fn dict_handles_multi_byte_varint_ids() {
+        // Single (key=300, value=16384) entry. count=1 + key varint + value varint.
+        let bytes = encode(&Value::Dict(vec![(300, 16384)]));
+        assert_eq!(bytes, vec![0x01, 0xAC, 0x02, 0x80, 0x80, 0x01]);
+    }
 }

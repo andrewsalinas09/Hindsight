@@ -58,9 +58,18 @@ impl ValueTag {
 pub enum Value {
     None,
     Bool(bool),
-    /// A signed integer fitting in i64.
+    /// A signed integer fitting in i64. Prefer this for any integer that fits
+    /// in i64 — `BigInt` is only for values outside that range.
     Int(i64),
     /// A big integer in two's complement, big-endian, minimum byte length.
+    ///
+    /// **Caller contract:** the bytes must already be canonicalized (two's
+    /// complement, big-endian, with leading 0x00 / 0xFF stripped down to the
+    /// minimum needed to preserve sign). The writer trusts these bytes; it
+    /// does not re-canonicalize them. They are used both as the on-disk
+    /// encoding and (via `canonical::canonical_inline`) as the bytes hashed
+    /// for `content_hash`. If the caller passes non-canonical bytes, two
+    /// equal big-int values may end up with distinct hashes.
     BigInt(Vec<u8>),
     Float(f64),
     String(String),

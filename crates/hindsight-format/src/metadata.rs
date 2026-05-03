@@ -122,6 +122,11 @@ fn write_basic_string(out: &mut String, s: &str) {
             '\x08' => out.push_str("\\b"),
             '\x0c' => out.push_str("\\f"),
             c if (c as u32) < 0x20 || c == '\x7f' => {
+                debug_assert!(
+                    c as u32 <= 0xFFFF,
+                    "TOML \\uXXXX escape only fits BMP (U+0000..U+FFFF); \
+                     supplementary-plane code points need \\UXXXXXXXX"
+                );
                 write!(out, "\\u{:04X}", c as u32).expect("write to String never fails");
             }
             c => out.push(c),

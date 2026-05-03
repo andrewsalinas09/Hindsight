@@ -73,6 +73,11 @@ pub struct FrameSnapshot {
     pub locals: Vec<Local>,
 }
 
+/// TODO(v0.3-spec): in v0.2 the frame is implicit (the most recent
+/// FUNCTION_ENTRY / FRAME_SWITCH). The v0.3 spec is expected to make
+/// `frame_id` explicit on all frame-scoped events including LINE_DELTA;
+/// when that lands, add the field here, in the payload writer below, and
+/// in the worked-example test that locks the on-disk byte layout.
 #[derive(Debug, Clone)]
 pub struct LineDelta {
     pub timestamp_delta_ns: u64,
@@ -143,7 +148,9 @@ fn write_event_payload<W: Write>(w: &mut W, event: &Event) -> io::Result<()> {
             }
         }
         Event::LineDelta(e) => {
-            // No frame_id: implicit, per spec §LINE_DELTA.
+            // No frame_id: implicit, per v0.2 spec §LINE_DELTA.
+            // TODO(v0.3-spec): emit frame_id varint here when v0.3 makes it
+            // explicit. See the doc comment on `LineDelta`.
             write_uvarint(w, e.timestamp_delta_ns)?;
             write_uvarint(w, u64::from(e.line))?;
             write_uvarint(w, e.changes.len() as u64)?;

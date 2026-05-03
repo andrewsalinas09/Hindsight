@@ -496,17 +496,61 @@ mod tests {
 
     #[test]
     fn none_and_sentinel_do_not_dedup_despite_same_canonical() {
-        // Both have empty canonical bytes; tag-aware dedup keeps them separate.
+        // Both canonicalize to empty bytes (so same content_hash); tag-aware
+        // dedup must keep them separate. After construction:
+        //   index 0 = Value::None
+        //   index 1 = Value::ExceptionUnwindSentinel
         let w = TraceWriter::new(empty_metadata());
-        assert_ne!(w.values[0].value.tag(), w.values[1].value.tag());
+        assert!(matches!(
+            w.values[NONE_VALUE_ID as usize].value,
+            Value::None
+        ));
+        assert!(matches!(
+            w.values[EXCEPTION_UNWIND_VALUE_ID as usize].value,
+            Value::ExceptionUnwindSentinel
+        ));
+        assert_ne!(NONE_VALUE_ID, EXCEPTION_UNWIND_VALUE_ID);
+        assert_ne!(
+            w.values[NONE_VALUE_ID as usize].value.tag(),
+            w.values[EXCEPTION_UNWIND_VALUE_ID as usize].value.tag()
+        );
+    }
+
+    #[test]
+    fn re_interning_none_and_sentinel_returns_reserved_ids() {
+        // Exercises the dedup path explicitly: re-attempting to intern these
+        // values after construction must return the reserved IDs, not allocate
+        // new entries.
+        let mut w = TraceWriter::new(empty_metadata());
+        let starting_len = w.values.len();
+        let none_again = w.intern_value_inline(Value::None);
+        let sentinel_again = w.intern_value_inline(Value::ExceptionUnwindSentinel);
+        assert_eq!(none_again, NONE_VALUE_ID);
+        assert_eq!(sentinel_again, EXCEPTION_UNWIND_VALUE_ID);
+        assert_eq!(
+            w.values.len(),
+            starting_len,
+            "no new entries should be allocated"
+        );
     }
 
     #[test]
     fn bool_false_and_int_zero_do_not_dedup() {
+        // Both canonicalize to bytes [0]; same content_hash. Tag in the dedup
+        // key keeps them separate.
         let mut w = TraceWriter::new(empty_metadata());
         let b = w.intern_value_inline(Value::Bool(false));
         let i = w.intern_value_inline(Value::Int(0));
         assert_ne!(b, i);
+        assert_eq!(w.values[b as usize].value.tag(), ValueTag::Bool);
+        assert_eq!(w.values[i as usize].value.tag(), ValueTag::IntSmall);
+        // And they share the same content hash (proving the tag is what
+        // distinguishes them, not different hashes).
+        assert_eq!(w.values[b as usize].hash, w.values[i as usize].hash);
+        assert_eq!(
+            w.values[b as usize].hash_kind,
+            w.values[i as usize].hash_kind
+        );
     }
 
     #[test]
