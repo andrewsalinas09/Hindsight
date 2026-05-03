@@ -2,12 +2,35 @@
 
 //! Buffered writer that produces a `.hindsight` trace file.
 //!
-//! Scope: file header, initial metadata, source bundle, initial string and
-//! value tables, one event block carrying any of the nine v0.2 event types,
-//! and (when finalized) a final summary block, an empty checkpoint index,
-//! and a footer. Checkpoints (block tag 0x02), table updates (0x03), and
-//! table snapshots (0x04) are out of scope for this revision; the single-
-//! event-block model is unchanged from the previous revision.
+//! ## Block stream model
+//!
+//! The writer emits blocks progressively into an in-memory buffer:
+//!
+//! - The prelude (file header, metadata, source bundle, initial string and
+//!   value tables) is written lazily on the first event-block flush.
+//! - Events are buffered until the configured `event_block_size_bytes`
+//!   threshold is reached, then flushed as a complete event block (tag 0x01).
+//! - Strings and values interned after the prelude has been written are
+//!   accumulated in pending state and flushed as a table update block (tag
+//!   0x03) immediately before any event block that would otherwise reference
+//!   IDs the reader doesn't know yet. Empty updates are skipped.
+//! - Checkpoint records (tag 0x02) are emitted between event blocks when the
+//!   configured event-count or wall-clock-ns interval is reached.
+//! - Snapshot blocks (tag 0x04) are emitted before a checkpoint when
+//!   `snapshot_interval_checkpoints` checkpoints have elapsed *since the last
+//!   snapshot* (so snapshot decisions are locally determined, not history-
+//!   dependent — see TODO(v0.3) in the spec).
+//! - At [`finish`](TraceWriter::finish): any pending events are flushed; an
+//!   empty event block is emitted if no event block has been emitted yet
+//!   (preserves the byte shape of "no events" traces); the final summary,
+//!   the populated checkpoint index, and the footer are written; finally
+//!   the header's `recording_end_ns` and `footer_offset` are back-patched.
+//!
+//! For traces small enough to fit in one block under the default config,
+//! the byte output is structurally identical to the previous single-block
+//! writer: prelude → one event block → final summary → empty checkpoint
+//! index → footer. See `default_config_small_trace_emits_single_event_block`
+//! in the integration tests.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -20,7 +43,7 @@ use crate::encoding::write_value_data;
 use crate::error::{FormatError, Result};
 use crate::event::{
     BranchResult, Event, EventTag, ExceptionRaised, FrameSnapshot, FrameSwitch, FunctionEntry,
-    FunctionExit, LineDelta, Note, ScopeBoundary, write_event,
+    FunctionExit, LineDelta, Note, ScopeBoundary, event_serialized_size, write_event,
 };
 use crate::metadata::Metadata;
 use crate::value::{HashKind, StringId, Value, ValueId, ValueTag};
@@ -44,6 +67,12 @@ pub const METADATA_FORMAT_TAG_TOML: u8 = 0x01;
 
 /// Block tag for an event block.
 pub const BLOCK_TAG_EVENT: u8 = 0x01;
+/// Block tag for a checkpoint record.
+pub const BLOCK_TAG_CHECKPOINT: u8 = 0x02;
+/// Block tag for a table update block.
+pub const BLOCK_TAG_TABLE_UPDATE: u8 = 0x03;
+/// Block tag for a table snapshot block.
+pub const BLOCK_TAG_TABLE_SNAPSHOT: u8 = 0x04;
 
 /// Reserved value table indices, per spec.
 pub const NONE_VALUE_ID: ValueId = 0;
@@ -52,6 +81,36 @@ pub const EXCEPTION_UNWIND_VALUE_ID: ValueId = 1;
 // Header field byte offsets used by the back-patching step at finalization.
 const HEADER_OFFSET_RECORDING_END: usize = 40;
 const HEADER_OFFSET_FOOTER_OFFSET: usize = 48;
+
+/// Tunable knobs for the writer's progressive emission. The defaults match
+/// the recommendations in `docs/trace-format.md` §"Implementation notes".
+#[derive(Debug, Clone)]
+pub struct WriterConfig {
+    /// Approximate uncompressed-bytes threshold at which the in-memory
+    /// event buffer is flushed as a new event block. Default 32 KiB.
+    pub event_block_size_bytes: usize,
+    /// Emit a checkpoint between event blocks once this many events have
+    /// been recorded since the last checkpoint. Default 10 000.
+    pub checkpoint_interval_events: u64,
+    /// Or once this many wall-clock ns have elapsed since the last
+    /// checkpoint (whichever fires first). Default 100 ms.
+    pub checkpoint_interval_ns: u64,
+    /// Emit a snapshot block before a checkpoint once this many checkpoints
+    /// have been emitted since the last snapshot. Default 100. Counted
+    /// since the previous snapshot (see TODO(v0.3) in the spec).
+    pub snapshot_interval_checkpoints: u32,
+}
+
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            event_block_size_bytes: 32 * 1024,
+            checkpoint_interval_events: 10_000,
+            checkpoint_interval_ns: 100_000_000,
+            snapshot_interval_checkpoints: 100,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct StoredValue {
@@ -149,6 +208,16 @@ pub struct Finalization {
     pub scope_resolution: ScopeResolution,
 }
 
+/// One pending entry for the checkpoint index. Offsets are absolute file
+/// offsets at the time the checkpoint record was emitted.
+#[derive(Debug, Clone, Copy)]
+struct PendingCheckpoint {
+    wall_clock_ns: u64,
+    event_id: u64,
+    file_offset: u64,
+    snapshot_offset: u64,
+}
+
 /// Buffered trace writer. Build up sources, strings, values, and events;
 /// call [`finish`](Self::finish) (or [`finish_to_bytes`](Self::finish_to_bytes))
 /// to emit a fully-finalized file, or [`write_unfinalized`](Self::write_unfinalized)
@@ -156,6 +225,7 @@ pub struct Finalization {
 /// header `recording_end` and `footer_offset` left at zero).
 pub struct TraceWriter {
     metadata: Metadata,
+    config: WriterConfig,
 
     sources: Vec<SourceFile>,
     source_lookup: HashMap<String, FileId>,
@@ -166,8 +236,73 @@ pub struct TraceWriter {
     values: Vec<StoredValue>,
     value_lookup: HashMap<ValueKey, ValueId>,
 
-    events: Vec<Event>,
     statistics: Statistics,
+
+    /// In-memory output buffer. Grows as blocks are emitted. The whole file
+    /// is buffered here before being handed to the caller's `Write`.
+    output: Vec<u8>,
+    /// True after the prelude (header through initial value table) has been
+    /// written into `output`. Strings/values present at that moment are the
+    /// initial table; anything interned after needs to land in an update
+    /// block before any subsequent event block that depends on it.
+    prelude_written: bool,
+    /// True once at least one event block has been emitted into `output`.
+    /// Used by `finish_to_bytes` to ensure even an empty trace gets one
+    /// (empty) event block — preserves the byte shape of empty traces from
+    /// before multi-block support.
+    any_event_block_emitted: bool,
+
+    /// Events buffered but not yet flushed to an event block.
+    pending_events: Vec<Event>,
+    /// Sum of `event_serialized_size(...)` over `pending_events`. Compared
+    /// against `config.event_block_size_bytes` to decide flush timing.
+    pending_events_size: usize,
+    /// Global event ID assigned to the next event recorded. Equals the total
+    /// number of events seen so far (events have stable IDs equal to their
+    /// position in the global event sequence).
+    next_event_id: u64,
+
+    /// Table sizes as last reflected in the on-disk stream — i.e., after
+    /// the initial table or the most recent table update or snapshot block.
+    /// New strings/values are flushed as an update before the next event
+    /// block when these fall behind the in-memory tables.
+    on_disk_string_count: usize,
+    on_disk_value_count: usize,
+
+    /// Wall-clock ns at the start of recording (mirror of metadata) plus
+    /// the cumulative sum of every `timestamp_delta_ns` recorded so far.
+    /// Used to drive checkpoint timing.
+    current_wall_ns: u64,
+    /// Counters since the last checkpoint emission, reset on each emit.
+    events_since_last_checkpoint: u64,
+    ns_since_last_checkpoint: u64,
+
+    /// File offset of the most recent table snapshot block (tag 0x04). Zero
+    /// if no snapshot block has been emitted yet — readers treat 0 as
+    /// "use the initial string and value tables that follow the file header"
+    /// (see TODO(v0.3) in the spec).
+    last_snapshot_offset: u64,
+    /// Number of checkpoints emitted since the most recent snapshot block.
+    /// Reset to zero each time a snapshot is emitted. Decision is locally
+    /// determined this way (Q4 of the session-3 design notes).
+    checkpoints_since_last_snapshot: u32,
+
+    /// Pending checkpoint index entries, one per checkpoint record emitted.
+    /// Written out as the checkpoint index section at finalize time.
+    checkpoint_index: Vec<PendingCheckpoint>,
+
+    /// Total number of blocks written into `output`, plus the final summary
+    /// block written at finalization. Drives `total_blocks` in the final
+    /// summary's `[final]` table.
+    ///
+    /// **Carry-over from session 2**: the previous revision counted
+    /// `event_block + final_summary = 2` for an empty trace. That decision
+    /// pre-dated checkpoint/update/snapshot blocks. This revision counts
+    /// every emitted block (event 0x01 + checkpoint 0x02 + update 0x03 +
+    /// snapshot 0x04) plus the final summary. For an empty trace the count
+    /// is still 2 — backward compatible for that case. See the updated
+    /// TODO(v0.3) in `docs/trace-format.md`.
+    total_blocks: u64,
 }
 
 impl CanonicalLookup for TraceWriter {
@@ -180,17 +315,39 @@ impl CanonicalLookup for TraceWriter {
 }
 
 impl TraceWriter {
+    /// Construct with the default [`WriterConfig`].
     pub fn new(metadata: Metadata) -> Self {
+        Self::with_config(metadata, WriterConfig::default())
+    }
+
+    /// Construct with a caller-supplied [`WriterConfig`].
+    pub fn with_config(metadata: Metadata, config: WriterConfig) -> Self {
+        let recording_start_ns = metadata.recording_start_ns;
         let mut w = Self {
             metadata,
+            config,
             sources: Vec::new(),
             source_lookup: HashMap::new(),
             strings: Vec::new(),
             string_lookup: HashMap::new(),
             values: Vec::new(),
             value_lookup: HashMap::new(),
-            events: Vec::new(),
             statistics: Statistics::default(),
+            output: Vec::new(),
+            prelude_written: false,
+            any_event_block_emitted: false,
+            pending_events: Vec::new(),
+            pending_events_size: 0,
+            next_event_id: 0,
+            on_disk_string_count: 0,
+            on_disk_value_count: 0,
+            current_wall_ns: recording_start_ns,
+            events_since_last_checkpoint: 0,
+            ns_since_last_checkpoint: 0,
+            last_snapshot_offset: 0,
+            checkpoints_since_last_snapshot: 0,
+            checkpoint_index: Vec::new(),
+            total_blocks: 0,
         };
         w.populate_reserved_values();
         w
@@ -372,8 +529,20 @@ impl TraceWriter {
     /// Every public `write_*` method must end here so statistics never drift
     /// from the on-disk event sequence.
     fn record_event(&mut self, event: Event) {
+        let delta = event.timestamp_delta_ns();
         self.statistics.bump(event.tag());
-        self.events.push(event);
+        self.current_wall_ns = self.current_wall_ns.saturating_add(delta);
+        self.ns_since_last_checkpoint = self.ns_since_last_checkpoint.saturating_add(delta);
+        self.events_since_last_checkpoint += 1;
+        self.next_event_id += 1;
+
+        let size = event_serialized_size(&event);
+        self.pending_events.push(event);
+        self.pending_events_size += size;
+
+        if self.pending_events_size >= self.config.event_block_size_bytes {
+            self.flush_pending_event_block();
+        }
     }
 
     pub fn write_function_entry(&mut self, e: FunctionEntry) -> Result<()> {
@@ -444,6 +613,205 @@ impl TraceWriter {
         Ok(())
     }
 
+    // --- Flush helpers ---
+
+    /// Write the prelude (header through initial value table) into `output`
+    /// if it hasn't been written yet. Sets `on_disk_string_count` /
+    /// `on_disk_value_count` to the freezes-at-prelude-time table sizes.
+    fn ensure_prelude_written(&mut self) {
+        if self.prelude_written {
+            return;
+        }
+        write_header(&mut self.output, &self.metadata);
+        write_metadata_block(&mut self.output, &self.metadata)
+            .expect("metadata fits in u32 by construction");
+        write_source_bundle(&mut self.output, &self.sources)
+            .expect("source bundle fits in u32 by construction");
+        write_initial_string_table(&mut self.output, &self.strings)
+            .expect("string table fits in u32 by construction");
+        write_initial_value_table(&mut self.output, &self.values)
+            .expect("value table fits in u32 by construction");
+        self.on_disk_string_count = self.strings.len();
+        self.on_disk_value_count = self.values.len();
+        self.prelude_written = true;
+    }
+
+    /// Flush the buffered events as one event block, optionally preceded by
+    /// a table update block if new strings/values have been interned since
+    /// the last on-disk table change. Triggers the post-block checkpoint /
+    /// snapshot decisions.
+    fn flush_pending_event_block(&mut self) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        self.ensure_prelude_written();
+        self.flush_pending_table_update();
+        self.emit_event_block_internal();
+        self.maybe_emit_checkpoint();
+    }
+
+    /// Emit a table update block if there are new strings or new values
+    /// beyond what's been published on disk. No-op otherwise (we deliberately
+    /// don't emit empty updates — see TODO(v0.3) in the spec).
+    fn flush_pending_table_update(&mut self) {
+        let new_strings = self.strings.len() - self.on_disk_string_count;
+        let new_values = self.values.len() - self.on_disk_value_count;
+        if new_strings == 0 && new_values == 0 {
+            return;
+        }
+        self.emit_table_update_block_internal(new_strings, new_values);
+    }
+
+    /// Emit one event block carrying `pending_events`. The on-disk header
+    /// fields are computed from the writer's current state.
+    fn emit_event_block_internal(&mut self) {
+        let events: Vec<Event> = std::mem::take(&mut self.pending_events);
+        self.pending_events_size = 0;
+
+        let event_count = events.len() as u64;
+        let first_event_id = self.next_event_id - event_count;
+
+        // Encode events to an uncompressed scratch buffer.
+        let mut uncompressed = Vec::new();
+        for event in &events {
+            write_event(&mut uncompressed, event).expect("Vec write");
+        }
+
+        let block_bytes = build_block(
+            BLOCK_TAG_EVENT,
+            &uncompressed,
+            first_event_id,
+            event_count,
+            self.strings.len() as u32,
+            self.values.len() as u32,
+        );
+        self.output.extend_from_slice(&block_bytes);
+        self.total_blocks += 1;
+        self.any_event_block_emitted = true;
+    }
+
+    /// Emit a table update block adding `new_strings` strings and
+    /// `new_values` values (those tail entries of `self.strings` and
+    /// `self.values`). Caller must have verified at least one is non-zero.
+    fn emit_table_update_block_internal(&mut self, new_strings: usize, new_values: usize) {
+        let base_string_count = self.on_disk_string_count as u32;
+        let base_value_count = self.on_disk_value_count as u32;
+        let new_string_count = new_strings as u32;
+        let new_value_count = new_values as u32;
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&base_string_count.to_le_bytes());
+        payload.extend_from_slice(&new_string_count.to_le_bytes());
+        for s in &self.strings[self.on_disk_string_count..] {
+            write_uvarint(&mut payload, s.len() as u64).expect("Vec write");
+            payload.extend_from_slice(s.as_bytes());
+        }
+        payload.extend_from_slice(&base_value_count.to_le_bytes());
+        payload.extend_from_slice(&new_value_count.to_le_bytes());
+        for v in &self.values[self.on_disk_value_count..] {
+            write_value_table_entry(&mut payload, v);
+        }
+
+        let block_bytes = build_block(
+            BLOCK_TAG_TABLE_UPDATE,
+            &payload,
+            self.next_event_id,
+            0,
+            self.strings.len() as u32,
+            self.values.len() as u32,
+        );
+        self.output.extend_from_slice(&block_bytes);
+        self.on_disk_string_count = self.strings.len();
+        self.on_disk_value_count = self.values.len();
+        self.total_blocks += 1;
+    }
+
+    /// Emit a snapshot block carrying the full current string and value
+    /// tables. After this, `on_disk_*_count` is left unchanged — snapshots
+    /// don't shift the "what's on disk" accounting because they're a parallel
+    /// recovery channel, not an additive one.
+    fn emit_snapshot_block_internal(&mut self) {
+        // Payload: [string table length u32][string count u32][strings]
+        //          [value table length u32][value count u32][values]
+        let mut payload = Vec::new();
+
+        let mut string_section = Vec::new();
+        string_section.extend_from_slice(&(self.strings.len() as u32).to_le_bytes());
+        for s in &self.strings {
+            write_uvarint(&mut string_section, s.len() as u64).expect("Vec write");
+            string_section.extend_from_slice(s.as_bytes());
+        }
+        payload.extend_from_slice(&(string_section.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&string_section);
+
+        let mut value_section = Vec::new();
+        value_section.extend_from_slice(&(self.values.len() as u32).to_le_bytes());
+        for v in &self.values {
+            write_value_table_entry(&mut value_section, v);
+        }
+        payload.extend_from_slice(&(value_section.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&value_section);
+
+        let snapshot_offset = self.output.len() as u64;
+        let block_bytes = build_block(
+            BLOCK_TAG_TABLE_SNAPSHOT,
+            &payload,
+            self.next_event_id,
+            0,
+            self.strings.len() as u32,
+            self.values.len() as u32,
+        );
+        self.output.extend_from_slice(&block_bytes);
+        self.last_snapshot_offset = snapshot_offset;
+        self.checkpoints_since_last_snapshot = 0;
+        self.total_blocks += 1;
+    }
+
+    /// Emit a checkpoint record (optionally preceded by a snapshot block
+    /// when the per-snapshot counter is at threshold) if checkpoint timing
+    /// thresholds are met. Resets the per-checkpoint counters.
+    fn maybe_emit_checkpoint(&mut self) {
+        if self.events_since_last_checkpoint < self.config.checkpoint_interval_events
+            && self.ns_since_last_checkpoint < self.config.checkpoint_interval_ns
+        {
+            return;
+        }
+
+        // Emit a snapshot first if the per-snapshot counter is at threshold.
+        // The snapshot's offset is what the checkpoint will reference.
+        if self.checkpoints_since_last_snapshot >= self.config.snapshot_interval_checkpoints {
+            self.emit_snapshot_block_internal();
+        }
+
+        let file_offset = self.output.len() as u64;
+        let payload = {
+            let mut p = Vec::new();
+            p.extend_from_slice(&self.current_wall_ns.to_le_bytes());
+            p.extend_from_slice(&self.last_snapshot_offset.to_le_bytes());
+            p
+        };
+        let block_bytes = build_block(
+            BLOCK_TAG_CHECKPOINT,
+            &payload,
+            self.next_event_id,
+            0,
+            self.strings.len() as u32,
+            self.values.len() as u32,
+        );
+        self.output.extend_from_slice(&block_bytes);
+        self.total_blocks += 1;
+
+        self.checkpoint_index.push(PendingCheckpoint {
+            wall_clock_ns: self.current_wall_ns,
+            event_id: self.next_event_id,
+            file_offset,
+            snapshot_offset: self.last_snapshot_offset,
+        });
+        self.checkpoints_since_last_snapshot += 1;
+        self.events_since_last_checkpoint = 0;
+        self.ns_since_last_checkpoint = 0;
+    }
+
     /// Emit the full `.hindsight` byte stream, fully finalized.
     pub fn finish<W: Write>(self, mut w: W, finalize: Finalization) -> Result<()> {
         let buf = self.finish_to_bytes(finalize)?;
@@ -453,92 +821,123 @@ impl TraceWriter {
 
     /// Emit the full byte stream as a `Vec<u8>`. Convenience for callers that
     /// want the bytes directly (tests, in-memory consumers).
-    pub fn finish_to_bytes(self, finalize: Finalization) -> Result<Vec<u8>> {
+    pub fn finish_to_bytes(mut self, finalize: Finalization) -> Result<Vec<u8>> {
         let recording_start_ns = self.metadata.recording_start_ns;
         let recording_end_ns = finalize.recording_end_ns;
 
-        let mut buf = Vec::new();
-        write_header(&mut buf, &self.metadata)?;
-        write_metadata_block(&mut buf, &self.metadata)?;
-        write_source_bundle(&mut buf, &self.sources)?;
-        write_initial_string_table(&mut buf, &self.strings)?;
-        write_initial_value_table(&mut buf, &self.values)?;
-        write_event_block(
-            &mut buf,
-            &self.events,
-            self.strings.len(),
-            self.values.len(),
-        )?;
+        // Flush any remaining buffered events.
+        self.flush_pending_event_block();
+        // Empty trace: no event block ever emitted. Emit a single empty one
+        // so the file always contains at least one event block. (Preserves
+        // the byte shape of empty traces from before multi-block support.)
+        if !self.any_event_block_emitted {
+            self.ensure_prelude_written();
+            self.emit_event_block_internal();
+        }
 
-        let final_summary_offset = buf.len() as u64;
-        // total_blocks counts both the single event block and the (also single)
-        // final-summary block. v0 always emits exactly these two; once
-        // checkpoints / table updates / table snapshots ship, this becomes
-        // a per-block counter on the writer.
-        let total_blocks: u64 = 2;
+        // Final summary counts itself as one block (carry-over from session
+        // 2 + revised in session 3 — see the doc comment on `total_blocks`).
+        self.total_blocks += 1;
         let trace_duration_ns = recording_end_ns.saturating_sub(recording_start_ns);
+
+        let final_summary_offset = self.output.len() as u64;
         write_final_summary(
-            &mut buf,
+            &mut self.output,
             &self.statistics,
-            total_blocks,
+            self.total_blocks,
             trace_duration_ns,
             &finalize.scope_resolution,
         )?;
 
-        let checkpoint_index_offset = buf.len() as u64;
-        write_checkpoint_index_empty(&mut buf)?;
+        let checkpoint_index_offset = self.output.len() as u64;
+        write_checkpoint_index(&mut self.output, &self.checkpoint_index)?;
 
-        let footer_offset = buf.len() as u64;
-        write_footer(&mut buf, checkpoint_index_offset, final_summary_offset)?;
+        let footer_offset = self.output.len() as u64;
+        write_footer(
+            &mut self.output,
+            checkpoint_index_offset,
+            final_summary_offset,
+        );
 
         // Back-patch the header's recording_end and footer_offset.
-        buf[HEADER_OFFSET_RECORDING_END..HEADER_OFFSET_RECORDING_END + 8]
+        self.output[HEADER_OFFSET_RECORDING_END..HEADER_OFFSET_RECORDING_END + 8]
             .copy_from_slice(&recording_end_ns.to_le_bytes());
-        buf[HEADER_OFFSET_FOOTER_OFFSET..HEADER_OFFSET_FOOTER_OFFSET + 8]
+        self.output[HEADER_OFFSET_FOOTER_OFFSET..HEADER_OFFSET_FOOTER_OFFSET + 8]
             .copy_from_slice(&footer_offset.to_le_bytes());
 
-        Ok(buf)
+        Ok(self.output)
     }
 
-    /// Emit a deliberately unfinalized byte stream: header through event
-    /// block only. The header's `recording_end` and `footer_offset` are left
-    /// at zero, signaling to readers that the trace is partial. Used by
-    /// tests; production recorders should call [`finish`](Self::finish).
-    pub fn write_unfinalized<W: Write>(self, mut w: W) -> Result<()> {
-        let mut buf = Vec::new();
-        write_header(&mut buf, &self.metadata)?;
-        write_metadata_block(&mut buf, &self.metadata)?;
-        write_source_bundle(&mut buf, &self.sources)?;
-        write_initial_string_table(&mut buf, &self.strings)?;
-        write_initial_value_table(&mut buf, &self.values)?;
-        write_event_block(
-            &mut buf,
-            &self.events,
-            self.strings.len(),
-            self.values.len(),
-        )?;
-        w.write_all(&buf)?;
+    /// Emit a deliberately unfinalized byte stream: prelude through the last
+    /// emitted block, with no final summary, checkpoint index, or footer.
+    /// The header's `recording_end` and `footer_offset` are left at zero.
+    pub fn write_unfinalized<W: Write>(mut self, mut w: W) -> Result<()> {
+        self.flush_pending_event_block();
+        if !self.any_event_block_emitted {
+            self.ensure_prelude_written();
+            self.emit_event_block_internal();
+        }
+        w.write_all(&self.output)?;
         Ok(())
     }
 }
 
-// --- Section writers (free functions so finish_to_bytes can stitch them) ---
+// --- Static block construction ---
 
-fn write_header(w: &mut Vec<u8>, metadata: &Metadata) -> Result<()> {
+/// Build a complete block (length prefix + tag + header + compressed payload)
+/// matching the layout in `docs/trace-format.md` §"Event blocks". Used by all
+/// four block tags; the per-tag interpretation of the payload is the caller's
+/// concern.
+fn build_block(
+    block_tag: u8,
+    uncompressed_payload: &[u8],
+    first_event_id: u64,
+    event_count: u64,
+    string_table_size_after: u32,
+    value_table_size_after: u32,
+) -> Vec<u8> {
+    let uncompressed_len = uncompressed_payload.len() as u64;
+    let compressed =
+        zstd::stream::encode_all(uncompressed_payload, 3).expect("zstd encode of in-memory buffer");
+    let compressed_len = compressed.len() as u64;
+    let checksum = crc32c::crc32c(&compressed);
+
+    let mut header = Vec::new();
+    write_uvarint(&mut header, compressed_len).expect("Vec write");
+    write_uvarint(&mut header, uncompressed_len).expect("Vec write");
+    write_uvarint(&mut header, first_event_id).expect("Vec write");
+    write_uvarint(&mut header, event_count).expect("Vec write");
+    header.extend_from_slice(&string_table_size_after.to_le_bytes());
+    header.extend_from_slice(&value_table_size_after.to_le_bytes());
+    header.extend_from_slice(&checksum.to_le_bytes());
+    let header_length = header.len() as u64;
+
+    let block_length = 1 + uvarint_len(header_length) + header.len() + compressed.len();
+    let block_length: u32 = block_length.try_into().expect("block fits in u32");
+
+    let mut block =
+        Vec::with_capacity(4 + 1 + uvarint_len(header_length) + header.len() + compressed.len());
+    block.extend_from_slice(&block_length.to_le_bytes());
+    block.push(block_tag);
+    write_uvarint(&mut block, header_length).expect("Vec write");
+    block.extend_from_slice(&header);
+    block.extend_from_slice(&compressed);
+    block
+}
+
+// --- Section writers ---
+
+fn write_header(w: &mut Vec<u8>, metadata: &Metadata) {
     let mut header = [0u8; 64];
     header[0..8].copy_from_slice(&FILE_MAGIC);
     header[8] = FORMAT_VERSION_MAJOR;
     header[9] = FORMAT_VERSION_MINOR;
-    // Flags (10..12), reserved zero in v0.2.
     header[12..16].copy_from_slice(&HEADER_LENGTH.to_le_bytes());
     header[16..32].copy_from_slice(&metadata.trace_uuid);
     header[32..40].copy_from_slice(&metadata.recording_start_ns.to_le_bytes());
     // recording_end (40..48) and footer_offset (48..56) start zero. They
-    // are back-patched at the end of finish_to_bytes when finalizing; for
-    // write_unfinalized they stay zero.
-    // Reserved (56..64): zero.
+    // are back-patched at the end of finish_to_bytes when finalizing.
     w.extend_from_slice(&header);
-    Ok(())
 }
 
 fn write_metadata_block(w: &mut Vec<u8>, metadata: &Metadata) -> Result<()> {
@@ -619,46 +1018,6 @@ fn write_initial_value_table(w: &mut Vec<u8>, values: &[StoredValue]) -> Result<
     Ok(())
 }
 
-fn write_event_block(
-    w: &mut Vec<u8>,
-    events: &[Event],
-    strings_len: usize,
-    values_len: usize,
-) -> Result<()> {
-    let mut uncompressed = Vec::new();
-    for event in events {
-        write_event(&mut uncompressed, event).expect("Vec write");
-    }
-    let uncompressed_len = uncompressed.len() as u64;
-
-    let compressed = zstd::stream::encode_all(&uncompressed[..], 3)
-        .map_err(|e| FormatError::Compression(e.to_string()))?;
-    let compressed_len = compressed.len() as u64;
-    let checksum = crc32c::crc32c(&compressed);
-
-    let mut header = Vec::new();
-    write_uvarint(&mut header, compressed_len).expect("Vec write");
-    write_uvarint(&mut header, uncompressed_len).expect("Vec write");
-    write_uvarint(&mut header, /* first_event_id */ 0).expect("Vec write");
-    write_uvarint(&mut header, events.len() as u64).expect("Vec write");
-    header.extend_from_slice(&(strings_len as u32).to_le_bytes());
-    header.extend_from_slice(&(values_len as u32).to_le_bytes());
-    header.extend_from_slice(&checksum.to_le_bytes());
-    let header_length = header.len() as u64;
-
-    let block_length = 1 + uvarint_len(header_length) + header.len() + compressed.len();
-    let block_length: u32 = block_length
-        .try_into()
-        .map_err(|_| FormatError::SectionTooLarge(block_length))?;
-
-    w.extend_from_slice(&block_length.to_le_bytes());
-    w.push(BLOCK_TAG_EVENT);
-    write_uvarint(w, header_length).expect("Vec write");
-    w.extend_from_slice(&header);
-    w.extend_from_slice(&compressed);
-    Ok(())
-}
-
 fn write_final_summary(
     w: &mut Vec<u8>,
     statistics: &Statistics,
@@ -668,10 +1027,6 @@ fn write_final_summary(
 ) -> Result<()> {
     let toml = render_final_summary_toml(statistics, total_blocks, trace_duration_ns, scope);
     let payload = toml.as_bytes();
-    // Practical limit: u32 max (4 GiB). The summary holds at most a handful
-    // of integers plus a list of recorded function names; even a recording
-    // covering hundreds of millions of distinct functions stays well under.
-    // Errors only fire if a caller jams a pathological scope_resolution in.
     let length: u32 = payload
         .len()
         .try_into()
@@ -681,29 +1036,31 @@ fn write_final_summary(
     Ok(())
 }
 
-fn write_checkpoint_index_empty(w: &mut Vec<u8>) -> Result<()> {
-    // Body is just a u32 entry-count = 0. Section length covers the count
-    // field but not itself, matching the convention used elsewhere.
-    let body = 0u32.to_le_bytes();
-    let length: u32 = body.len() as u32;
+fn write_checkpoint_index(w: &mut Vec<u8>, entries: &[PendingCheckpoint]) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        body.extend_from_slice(&entry.wall_clock_ns.to_le_bytes());
+        body.extend_from_slice(&entry.event_id.to_le_bytes());
+        body.extend_from_slice(&entry.file_offset.to_le_bytes());
+        body.extend_from_slice(&entry.snapshot_offset.to_le_bytes());
+    }
+    let length: u32 = body
+        .len()
+        .try_into()
+        .map_err(|_| FormatError::SectionTooLarge(body.len()))?;
     w.extend_from_slice(&length.to_le_bytes());
     w.extend_from_slice(&body);
     Ok(())
 }
 
-fn write_footer(
-    w: &mut Vec<u8>,
-    checkpoint_index_offset: u64,
-    final_summary_offset: u64,
-) -> Result<()> {
+fn write_footer(w: &mut Vec<u8>, checkpoint_index_offset: u64, final_summary_offset: u64) {
     let mut footer = [0u8; 32];
     footer[0..8].copy_from_slice(&FOOTER_MAGIC);
     footer[8..12].copy_from_slice(&FOOTER_LENGTH.to_le_bytes());
     footer[12..20].copy_from_slice(&checkpoint_index_offset.to_le_bytes());
     footer[20..28].copy_from_slice(&final_summary_offset.to_le_bytes());
-    // Reserved (28..32): zero.
     w.extend_from_slice(&footer);
-    Ok(())
 }
 
 fn write_value_table_entry(w: &mut Vec<u8>, v: &StoredValue) {
@@ -966,7 +1323,6 @@ mod tests {
             buf.len() - FOOTER_LENGTH as usize,
             "footer should be the last 32 bytes"
         );
-        // Footer magic should be at footer_offset.
         assert_eq!(
             &buf[footer_offset as usize..footer_offset as usize + 8],
             &FOOTER_MAGIC,
@@ -1034,8 +1390,6 @@ mod tests {
     fn finish_to_bytes_writes_footer_with_correct_offsets() {
         let w = TraceWriter::new(empty_metadata());
         let buf = w.finish_to_bytes(default_finalize()).unwrap();
-        // The footer is at the end; checkpoint_index_offset is the second u64
-        // in the footer, final_summary_offset is the third.
         let footer_start = buf.len() - FOOTER_LENGTH as usize;
         assert_eq!(&buf[footer_start..footer_start + 8], &FOOTER_MAGIC);
         let footer_length =
@@ -1053,5 +1407,14 @@ mod tests {
         );
         assert!(final_summary_offset < checkpoint_index_offset);
         assert!(checkpoint_index_offset < footer_start as u64);
+    }
+
+    #[test]
+    fn writer_config_default_matches_spec_implementation_notes() {
+        let c = WriterConfig::default();
+        assert_eq!(c.event_block_size_bytes, 32 * 1024);
+        assert_eq!(c.checkpoint_interval_events, 10_000);
+        assert_eq!(c.checkpoint_interval_ns, 100_000_000);
+        assert_eq!(c.snapshot_interval_checkpoints, 100);
     }
 }

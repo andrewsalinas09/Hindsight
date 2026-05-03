@@ -31,11 +31,12 @@ pub use event::{
 pub use metadata::{Metadata, ProgramInfo, RecorderInfo, RecordingInfo, ScopeConfig};
 pub use reader::{
     CheckpointEntry, EventBlockInfo, FinalSummary, Footer, Header, MetadataBlock, SourceFile,
-    TraceReader, ValueEntry,
+    TraceCursor, TraceReader, ValueEntry,
 };
 pub use value::{HashKind, StringId, Value, ValueId, ValueTag};
 pub use writer::{
-    BLOCK_TAG_EVENT, EXCEPTION_UNWIND_VALUE_ID, ExcludedFunction, FILE_MAGIC, FOOTER_LENGTH,
-    FOOTER_MAGIC, FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR, FileId, Finalization, HEADER_LENGTH,
-    METADATA_FORMAT_TAG_TOML, NONE_VALUE_ID, ScopeResolution, TraceWriter,
+    BLOCK_TAG_CHECKPOINT, BLOCK_TAG_EVENT, BLOCK_TAG_TABLE_SNAPSHOT, BLOCK_TAG_TABLE_UPDATE,
+    EXCEPTION_UNWIND_VALUE_ID, ExcludedFunction, FILE_MAGIC, FOOTER_LENGTH, FOOTER_MAGIC,
+    FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR, FileId, Finalization, HEADER_LENGTH,
+    METADATA_FORMAT_TAG_TOML, NONE_VALUE_ID, ScopeResolution, TraceWriter, WriterConfig,
 };

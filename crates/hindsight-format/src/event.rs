@@ -231,6 +231,32 @@ impl Event {
             Event::FrameSwitch(_) => EventTag::FrameSwitch,
         }
     }
+
+    /// Nanoseconds elapsed since the previous event in the trace. Used by
+    /// the writer to track wall-clock progress for checkpoint timing.
+    pub fn timestamp_delta_ns(&self) -> u64 {
+        match self {
+            Event::FunctionEntry(e) => e.timestamp_delta_ns,
+            Event::FunctionExit(e) => e.timestamp_delta_ns,
+            Event::FrameSnapshot(e) => e.timestamp_delta_ns,
+            Event::LineDelta(e) => e.timestamp_delta_ns,
+            Event::BranchResult(e) => e.timestamp_delta_ns,
+            Event::ExceptionRaised(e) => e.timestamp_delta_ns,
+            Event::Note(e) => e.timestamp_delta_ns,
+            Event::ScopeBoundary(e) => e.timestamp_delta_ns,
+            Event::FrameSwitch(e) => e.timestamp_delta_ns,
+        }
+    }
+}
+
+/// Exact serialized size of an event in bytes, as the writer would emit it
+/// (length varint + tag byte + payload). Used by the writer to decide when
+/// the pending event buffer has reached its block-size threshold; computed
+/// by serializing into a scratch buffer (cheap — events are tens of bytes).
+pub(crate) fn event_serialized_size(event: &Event) -> usize {
+    let mut buf = Vec::new();
+    write_event(&mut buf, event).expect("Vec write");
+    buf.len()
 }
 
 /// Write an event's wire form: varint(event_length) + tag byte + payload.

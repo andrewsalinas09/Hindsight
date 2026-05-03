@@ -118,6 +118,45 @@ pub enum FormatError {
     /// parsed the footer.
     #[error("header footer_offset mismatch: header says {expected}, reader observed {observed}")]
     HeaderFooterOffsetMismatch { expected: u64, observed: u64 },
+    /// A table update block's declared `base_string_count` or
+    /// `base_value_count` did not match the reader's reconstructed table
+    /// size at the moment the update was applied. Indicates either
+    /// out-of-order blocks or a writer bug.
+    #[error("table update {field} mismatch: block says base = {expected}, reader has {observed}")]
+    TableUpdateBaseMismatch {
+        field: &'static str,
+        expected: u32,
+        observed: u32,
+    },
+    /// A table update block's `new_count` field added to its `base_count`
+    /// produced a total that didn't match the actual number of entries
+    /// decoded from the payload.
+    #[error(
+        "table update {field} new-count mismatch: header says {expected}, payload has {observed}"
+    )]
+    TableUpdateNewCountMismatch {
+        field: &'static str,
+        expected: u32,
+        observed: u32,
+    },
+    /// A snapshot block's payload didn't decode into the table sizes that
+    /// the block header's `string_table_size_after` / `value_table_size_after`
+    /// fields claimed.
+    #[error(
+        "snapshot {field} count mismatch: block header says {expected}, payload has {observed}"
+    )]
+    SnapshotCountMismatch {
+        field: &'static str,
+        expected: u32,
+        observed: u32,
+    },
+    /// `seek_*` was called on an unfinalized trace. v0 seeking depends on the
+    /// checkpoint index, which only exists in finalized files.
+    #[error("seek requires a finalized trace (no checkpoint index in unfinalized files)")]
+    SeekUnfinalized,
+    /// `seek_to_event_id` was called with an event_id past the last event.
+    #[error("seek target event_id {target} is past the last event ({last})")]
+    SeekPastEnd { target: u64, last: u64 },
     /// Event length prefix was zero — at minimum the type tag byte must fit.
     #[error("event with zero length prefix")]
     EmptyEvent,

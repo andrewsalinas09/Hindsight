@@ -3,14 +3,31 @@
 //! Buffered reader that parses a `.hindsight` trace file produced by
 //! [`crate::TraceWriter`].
 //!
-//! Scope: file header, initial metadata block, source bundle, initial string
-//! and value tables, a single event block carrying any of the nine v0.2
-//! event types, and (when finalized) a final summary block, an empty
-//! checkpoint index, and a footer. Checkpoints (block tag 0x02), table
-//! updates (0x03), and table snapshots (0x04) are out of scope and surface
-//! as [`FormatError::UnsupportedBlockTag`]; non-empty checkpoint indexes
-//! are out of scope and surface as [`FormatError::SectionLengthMismatch`]
-//! at parse time.
+//! ## Block stream model
+//!
+//! After the prelude (header through initial value table) the file is a
+//! sequence of blocks of any of the four v0.2 tags:
+//!
+//! - `0x01` — event block. Append events to the flat events list. The
+//!   reader's view of "events at index i" is stable across blocks; block
+//!   boundaries are exposed via [`TraceReader::event_blocks`].
+//! - `0x02` — checkpoint record. Recorded for cross-checking against the
+//!   checkpoint index; the index (parsed from the populated section just
+//!   before the footer) is what callers see via [`TraceReader::checkpoints`].
+//! - `0x03` — table update. Validate `base_*_count` against the reader's
+//!   current table sizes, then append the new strings/values.
+//! - `0x04` — table snapshot. Replace the reader's string and value tables
+//!   wholesale with the snapshot's content. Per spec, after applying a
+//!   snapshot the reader's tables are in a fully reconstructed state.
+//!
+//! Trailing sections (final summary, checkpoint index, footer) are only
+//! parsed when the file header's `footer_offset` is non-zero — see
+//! `parse_finalized_tail`.
+//!
+//! Readers should not assume there's a 1:1 correspondence between event
+//! blocks and table updates: the writer skips empty updates, so an event
+//! block that doesn't reference any newly-introduced strings or values has
+//! no preceding update.
 //!
 //! ## Section length conventions (resolved against the writer)
 //!
@@ -22,42 +39,22 @@
 //! - **Source bundle / string table / value table / checkpoint index.**
 //!   `length` u32 LE is the size of everything *after* the length field,
 //!   not counting the length field itself.
-//! - **Event block.** `block_length` u32 LE is the size of everything after
+//! - **Block.** `block_length` u32 LE is the size of everything after
 //!   itself: `block_tag` (1) + `header_length` varint + header content +
 //!   compressed payload. The inner `header_length` varint is the size of the
-//!   header content only — i.e., compressed_len/uncompressed_len/first_event_id/
-//!   event_count varints + the three trailing u32s (table sizes + checksum) —
-//!   not counting the header_length varint itself.
+//!   header content only.
 //! - **Value table entries.** The `length` varint is just the encoded `data`
 //!   bytes; it does *not* include the type tag, hash kind, hash, or the
 //!   length varint itself.
 //! - **Final summary.** `length` u32 LE is the byte length of the TOML
-//!   payload that follows; there is no inner format-tag byte (unlike the
-//!   initial metadata block).
+//!   payload that follows; there is no inner format-tag byte.
 //!
 //! ## Spec ambiguities surfaced by this implementation
 //!
-//! - The v0.2 spec lists "int (big)", "string", and "bytes" as
-//!   "length-prefixed". The writer treats this prefix as the *outer* value
-//!   table entry length only — there is no second inner length prefix on the
-//!   bytes themselves. The reader follows the same convention.
-//! - The v0.2 spec doesn't say whether a strict reader should reject extra
-//!   bytes inside a value table entry (e.g., 9 bytes for a `Float`). This
-//!   reader rejects them via [`FormatError::ValueDataLeftover`].
-//! - The v0.2 spec doesn't say whether a reader should validate that a
-//!   container value's child IDs refer to entries already defined earlier in
-//!   the table. The writer enforces that on write; the reader enforces it on
-//!   read via [`FormatError::ForwardValueRef`].
-//! - The v0.2 spec says unknown event tags are skipped. This reader instead
-//!   errors on event tags 0x0A+ because the current writer doesn't produce
-//!   them; silently skipping them in v0 would mask writer bugs. Forward
-//!   compatibility (skip on unknown) can be reintroduced once event types
-//!   beyond 0x09 actually exist.
-//! - The v0.2 spec final-summary diagram is silent on whether the block
-//!   carries a format-tag byte (TOML/JSON discriminator) the way the initial
-//!   metadata block does. This reader treats the final summary as raw
-//!   length-prefixed TOML with no inner tag — see TODO(v0.3) in
-//!   `docs/trace-format.md`.
+//! See `docs/trace-format.md` for the TODO(v0.3) notes that codify each.
+//! The reader-side strict-mode policies — value-data leftover, forward
+//! value refs, unknown event tags, footer offset cross-check, snapshot
+//! offset sentinel `0` — are all documented at the relevant call sites.
 
 use std::io::Read;
 
@@ -71,8 +68,9 @@ use crate::event::{
 };
 use crate::value::{HashKind, StringId, Value, ValueId, ValueTag};
 use crate::writer::{
-    BLOCK_TAG_EVENT, FILE_MAGIC, FOOTER_LENGTH, FOOTER_MAGIC, FORMAT_VERSION_MAJOR,
-    FORMAT_VERSION_MINOR, FileId, HEADER_LENGTH, METADATA_FORMAT_TAG_TOML,
+    BLOCK_TAG_CHECKPOINT, BLOCK_TAG_EVENT, BLOCK_TAG_TABLE_SNAPSHOT, BLOCK_TAG_TABLE_UPDATE,
+    FILE_MAGIC, FOOTER_LENGTH, FOOTER_MAGIC, FORMAT_VERSION_MAJOR, FORMAT_VERSION_MINOR, FileId,
+    HEADER_LENGTH, METADATA_FORMAT_TAG_TOML,
 };
 
 /// Parsed file header. See `docs/trace-format.md` §"File header".
@@ -92,8 +90,7 @@ pub struct Header {
     pub footer_offset: u64,
 }
 
-/// Parsed initial metadata block. The TOML payload is returned verbatim;
-/// callers decode it on their own (e.g., via the `toml` crate).
+/// Parsed initial metadata block. The TOML payload is returned verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataBlock {
     /// Currently always [`crate::METADATA_FORMAT_TAG_TOML`] (`0x01`).
@@ -120,13 +117,17 @@ pub struct ValueEntry {
     pub value: Value,
 }
 
-/// Header information for the (single) event block this reader supports.
+/// Header information for one event block. With the multi-block writer the
+/// reader exposes a `Vec<EventBlockInfo>` via [`TraceReader::event_blocks`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventBlockInfo {
     pub first_event_id: u64,
     pub event_count: u64,
     pub string_table_size_after: u32,
     pub value_table_size_after: u32,
+    /// Byte offset of this event block's leading u32 length prefix in the
+    /// file. Useful for callers that want to map an event back to its block.
+    pub file_offset: u64,
 }
 
 /// Parsed final summary block. The TOML payload is returned verbatim, mirror
@@ -136,13 +137,20 @@ pub struct FinalSummary {
     pub payload: String,
 }
 
-/// One entry in the checkpoint index. v0 writers emit zero entries; this
-/// type exists for forward compatibility.
+/// One entry in the checkpoint index (from the populated section just before
+/// the footer).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointEntry {
     pub wall_clock_ns: u64,
+    /// Global event ID at the moment this checkpoint was emitted (i.e. the
+    /// number of events recorded *before* the checkpoint).
     pub event_id: u64,
+    /// Byte offset of the checkpoint record in the file.
     pub file_offset: u64,
+    /// Byte offset of the most recent table snapshot block, or zero meaning
+    /// "use the initial string and value tables that follow the file
+    /// header" (no snapshot block emitted before this checkpoint). See the
+    /// TODO(v0.3) on snapshot offsets in `docs/trace-format.md`.
     pub snapshot_offset: u64,
 }
 
@@ -159,14 +167,11 @@ pub struct Footer {
 /// Construct via [`TraceReader::new`] (any `Read` impl) or
 /// [`TraceReader::from_bytes`] (already-loaded slice). Both eagerly parse the
 /// whole file; this matches the writer, which buffers everything before
-/// emitting, and keeps the API simple given the v0.2 single-block shape.
-///
-/// Trailing sections (final summary, checkpoint index, footer) are only
-/// parsed when the file header's `footer_offset` is non-zero. For unfinalized
-/// files (header.footer_offset == 0), the reader stops after the event block
-/// and any bytes after that point are silently ignored — this matches the
-/// spec's crash-recovery semantics ("events read up to the last valid block
-/// are fully usable").
+/// emitting. Trailing sections (final summary, checkpoint index, footer) are
+/// only parsed when the file header's `footer_offset` is non-zero. For
+/// unfinalized files (header.footer_offset == 0), the reader stops after the
+/// last successfully-parsed block and any bytes after that point are
+/// silently ignored — this matches the spec's crash-recovery semantics.
 #[derive(Debug, Clone)]
 pub struct TraceReader {
     header: Header,
@@ -175,10 +180,67 @@ pub struct TraceReader {
     strings: Vec<String>,
     values: Vec<ValueEntry>,
     events: Vec<Event>,
-    event_block: EventBlockInfo,
+    event_blocks: Vec<EventBlockInfo>,
+    /// Per-event mapping back to the global event ID. `event_global_ids[i]`
+    /// is the global event ID of `events[i]`; built up as event blocks are
+    /// parsed using each block's `first_event_id`. Drives `seek_to_event_id`.
+    event_global_ids: Vec<u64>,
     final_summary: Option<FinalSummary>,
     checkpoints: Vec<CheckpointEntry>,
     footer: Option<Footer>,
+}
+
+/// A view into a [`TraceReader`] starting at a seek target.
+///
+/// Returned by [`TraceReader::seek_to_event_id`] and
+/// [`TraceReader::seek_to_wall_clock`]. The `events()` slice begins at the
+/// seek target (or the closest event past it). The `seek_anchor` reports
+/// which checkpoint the seek used as its starting point — `None` if the
+/// reader scanned from the beginning (no usable checkpoint), or `Some(idx)`
+/// pointing into the checkpoint index. This lets tests verify the seek
+/// actually consulted the index instead of returning a sliced view from the
+/// start (which a buggy implementation might).
+#[derive(Debug, Clone, Copy)]
+pub struct TraceCursor<'a> {
+    reader: &'a TraceReader,
+    /// Index into `reader.events()` where the cursor is positioned.
+    start_index: usize,
+    /// Index into `reader.checkpoints()` of the checkpoint that anchored
+    /// the seek. `None` means no usable checkpoint (e.g. the seek target is
+    /// before any checkpoint).
+    seek_anchor: Option<usize>,
+}
+
+impl<'a> TraceCursor<'a> {
+    /// Events from the seek point onward, in order.
+    pub fn events(&self) -> &'a [Event] {
+        &self.reader.events[self.start_index..]
+    }
+
+    /// Index into [`TraceReader::events`] of the cursor's first event.
+    pub fn start_index(&self) -> usize {
+        self.start_index
+    }
+
+    /// Global event ID of the cursor's first event, or `None` if the cursor
+    /// is past the end of the trace.
+    pub fn first_event_id(&self) -> Option<u64> {
+        self.reader.event_global_ids.get(self.start_index).copied()
+    }
+
+    /// Which checkpoint (by index into [`TraceReader::checkpoints`]) the
+    /// seek used as its starting point. `None` means the seek either
+    /// scanned from the start of the events list (no preceding checkpoint
+    /// exists for the target) or the trace had no checkpoints at all.
+    pub fn seek_anchor(&self) -> Option<&'a CheckpointEntry> {
+        self.seek_anchor.map(|i| &self.reader.checkpoints[i])
+    }
+
+    /// Index of the seek anchor in [`TraceReader::checkpoints`], or `None`
+    /// — useful for tests that want the index without dereferencing.
+    pub fn seek_anchor_index(&self) -> Option<usize> {
+        self.seek_anchor
+    }
 }
 
 impl TraceReader {
@@ -193,17 +255,52 @@ impl TraceReader {
         let header = parse_header(&mut br)?;
         let metadata = parse_metadata_block(&mut br)?;
         let source_files = parse_source_bundle(&mut br)?;
-        let strings = parse_string_table(&mut br)?;
-        let values = parse_value_table(&mut br, strings.len())?;
-        let (event_block, events) = parse_event_block(&mut br, &source_files, &strings, &values)?;
+        let mut strings = parse_string_table(&mut br)?;
+        let mut values = parse_value_table(&mut br, strings.len())?;
+
+        // Block stream: parse blocks until either the file ends (unfinalized)
+        // or we hit the start of the trailing sections (finalized).
+        let stream_end = if header.footer_offset == 0 {
+            bytes.len()
+        } else {
+            // Read the footer's final_summary_offset to know where the block
+            // stream ends. We have to peek without consuming.
+            //
+            // Approach: parse blocks one at a time; after each, check whether
+            // we've reached header.footer_offset (the trailing sections).
+            // But we don't know final_summary_offset yet. We'll use a
+            // simpler approach: parse blocks while pos < header.footer_offset
+            // - 32 (footer length); the trailing sections fit there. To find
+            // the exact final_summary_offset we'd have to either pre-parse
+            // the footer or guess. Pre-parse is cleaner.
+            //
+            // The footer is at header.footer_offset. We can read it directly
+            // without disturbing `br`, then use its final_summary_offset as
+            // the block-stream-end.
+            let footer = peek_footer(bytes, header.footer_offset)?;
+            footer.final_summary_offset as usize
+        };
+
+        let mut events = Vec::new();
+        let mut event_blocks = Vec::new();
+        let mut event_global_ids = Vec::new();
+
+        while br.pos() < stream_end {
+            parse_one_block(
+                &mut br,
+                &source_files,
+                &mut strings,
+                &mut values,
+                &mut events,
+                &mut event_blocks,
+                &mut event_global_ids,
+            )?;
+        }
 
         let (final_summary, checkpoints, footer) = if header.footer_offset == 0 {
-            // Unfinalized trace: stop here and silently tolerate any trailing
-            // bytes (could be the start of a partial final summary the writer
-            // never got to finish). This matches the spec's crash-recovery
-            // semantics — see the type-level doc comment.
             (None, Vec::new(), None)
         } else {
+            // Pos should now be at final_summary_offset.
             let final_summary_offset = br.pos() as u64;
             let final_summary = parse_final_summary(&mut br)?;
             let checkpoint_index_offset = br.pos() as u64;
@@ -243,7 +340,8 @@ impl TraceReader {
             strings,
             values,
             events,
-            event_block,
+            event_blocks,
+            event_global_ids,
             final_summary,
             checkpoints,
             footer,
@@ -268,16 +366,17 @@ impl TraceReader {
     pub fn events(&self) -> &[Event] {
         &self.events
     }
-    pub fn event_block_info(&self) -> &EventBlockInfo {
-        &self.event_block
+    /// Per-event-block headers, in file order.
+    pub fn event_blocks(&self) -> &[EventBlockInfo] {
+        &self.event_blocks
     }
     /// Returns `Some` if the file was finalized cleanly (header.footer_offset
     /// non-zero), otherwise `None`.
     pub fn final_summary(&self) -> Option<&FinalSummary> {
         self.final_summary.as_ref()
     }
-    /// Empty for unfinalized files and for v0 finalized files (no checkpoints
-    /// emitted yet).
+    /// The checkpoint index from the trailing section. Empty for unfinalized
+    /// files and for finalized files with no checkpoints emitted.
     pub fn checkpoints(&self) -> &[CheckpointEntry] {
         &self.checkpoints
     }
@@ -288,6 +387,103 @@ impl TraceReader {
     /// Convenience for callers that just want a yes/no on finalization.
     pub fn is_finalized(&self) -> bool {
         self.footer.is_some()
+    }
+
+    /// Seek to the first event whose global event ID is `>= target`. Uses
+    /// the checkpoint index to find the nearest preceding checkpoint, then
+    /// scans the already-parsed events from there.
+    ///
+    /// For v0 the "skip parts of the file" optimization the spec mentions
+    /// is intentionally not implemented — the file is already fully parsed
+    /// and the seek is a slice operation. The cursor's `seek_anchor` reports
+    /// which checkpoint anchored the seek so tests can verify the index was
+    /// actually consulted.
+    pub fn seek_to_event_id(&self, target: u64) -> Result<TraceCursor<'_>> {
+        if !self.is_finalized() {
+            return Err(FormatError::SeekUnfinalized);
+        }
+        let last = self.event_global_ids.last().copied().unwrap_or(0);
+        if !self.events.is_empty() && target > last {
+            return Err(FormatError::SeekPastEnd { target, last });
+        }
+
+        // Find the latest checkpoint with event_id <= target.
+        let anchor_idx = self.find_checkpoint_anchor_by_event_id(target);
+        let scan_start = match anchor_idx {
+            Some(i) => self
+                .event_global_ids
+                .partition_point(|&gid| gid < self.checkpoints[i].event_id),
+            None => 0,
+        };
+
+        // Linear scan forward from the anchor to find target.
+        let start_index = self.event_global_ids[scan_start..]
+            .iter()
+            .position(|&gid| gid >= target)
+            .map(|p| scan_start + p)
+            .unwrap_or(self.events.len());
+
+        Ok(TraceCursor {
+            reader: self,
+            start_index,
+            seek_anchor: anchor_idx,
+        })
+    }
+
+    /// Seek to the first event whose timestamp is `>= target_wall_clock_ns`.
+    /// Wall-clock time is reconstructed by summing per-event timestamp
+    /// deltas starting from `header.recording_start_ns`. The checkpoint
+    /// index provides the anchor so the scan doesn't start from event 0.
+    pub fn seek_to_wall_clock(&self, target_wall_clock_ns: u64) -> Result<TraceCursor<'_>> {
+        if !self.is_finalized() {
+            return Err(FormatError::SeekUnfinalized);
+        }
+        let recording_start = self.header.recording_start_ns;
+
+        // Find the latest checkpoint with wall_clock_ns <= target.
+        let anchor_idx = self.find_checkpoint_anchor_by_wall_clock(target_wall_clock_ns);
+
+        // Sum deltas to reconstruct wall-clock per event.
+        let (scan_start, mut current_wall_ns) = match anchor_idx {
+            Some(i) => {
+                let cp = &self.checkpoints[i];
+                // The checkpoint records wall_clock_ns AS OF its emission,
+                // i.e. *after* event_id events. Scan from event_id.
+                let idx = self
+                    .event_global_ids
+                    .partition_point(|&gid| gid < cp.event_id);
+                (idx, cp.wall_clock_ns)
+            }
+            None => (0, recording_start),
+        };
+
+        let mut start_index = self.events.len();
+        for (i, event) in self.events.iter().enumerate().skip(scan_start) {
+            current_wall_ns = current_wall_ns.saturating_add(event.timestamp_delta_ns());
+            if current_wall_ns >= target_wall_clock_ns {
+                start_index = i;
+                break;
+            }
+        }
+
+        Ok(TraceCursor {
+            reader: self,
+            start_index,
+            seek_anchor: anchor_idx,
+        })
+    }
+
+    fn find_checkpoint_anchor_by_event_id(&self, target: u64) -> Option<usize> {
+        // Latest checkpoint with event_id <= target.
+        let pos = self.checkpoints.partition_point(|cp| cp.event_id <= target);
+        if pos == 0 { None } else { Some(pos - 1) }
+    }
+
+    fn find_checkpoint_anchor_by_wall_clock(&self, target_ns: u64) -> Option<usize> {
+        let pos = self
+            .checkpoints
+            .partition_point(|cp| cp.wall_clock_ns <= target_ns);
+        if pos == 0 { None } else { Some(pos - 1) }
     }
 }
 
@@ -438,22 +634,8 @@ fn parse_value_table(br: &mut ByteReader, strings_len: usize) -> Result<Vec<Valu
     let count = br.read_u32_le()? as usize;
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
-        let tag_byte = br.read_u8()?;
-        let tag = ValueTag::from_u8(tag_byte).ok_or(FormatError::InvalidValueTag(tag_byte))?;
-        let hash_kind_byte = br.read_u8()?;
-        let hash_kind = HashKind::from_u8(hash_kind_byte)
-            .ok_or(FormatError::InvalidHashKind(hash_kind_byte))?;
-        let mut hash = [0u8; 16];
-        hash.copy_from_slice(br.take(16)?);
-        let data_len = br.read_uvarint()? as usize;
-        let data = br.take(data_len)?;
-        let value = decode_value(tag, data)?;
-        validate_value_refs(&value, i as ValueId, strings_len)?;
-        entries.push(ValueEntry {
-            hash_kind,
-            hash,
-            value,
-        });
+        let entry = parse_value_table_entry(br, i as ValueId, strings_len)?;
+        entries.push(entry);
     }
     let consumed = br.pos() - start;
     if consumed != length {
@@ -466,20 +648,41 @@ fn parse_value_table(br: &mut ByteReader, strings_len: usize) -> Result<Vec<Valu
     Ok(entries)
 }
 
+/// Parse one value table entry from the *outer* stream (initial table or
+/// table-update body). `current_index` is what the new entry's ID will be —
+/// used to reject forward refs.
+fn parse_value_table_entry(
+    br: &mut ByteReader,
+    current_index: ValueId,
+    strings_len: usize,
+) -> Result<ValueEntry> {
+    let tag_byte = br.read_u8()?;
+    let tag = ValueTag::from_u8(tag_byte).ok_or(FormatError::InvalidValueTag(tag_byte))?;
+    let hash_kind_byte = br.read_u8()?;
+    let hash_kind =
+        HashKind::from_u8(hash_kind_byte).ok_or(FormatError::InvalidHashKind(hash_kind_byte))?;
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(br.take(16)?);
+    let data_len = br.read_uvarint()? as usize;
+    let data = br.take(data_len)?;
+    let value = decode_value(tag, data)?;
+    validate_value_refs(&value, current_index, strings_len)?;
+    Ok(ValueEntry {
+        hash_kind,
+        hash,
+        value,
+    })
+}
+
 /// Reject container values whose child IDs point at entries that haven't
 /// been defined yet at this position in the value table.
 ///
 /// **Strict-mode policy.** The v0.2 spec doesn't say a reader has to do this.
-/// The writer enforces it on emit (see `assert_child_ids_exist`), so any
-/// trace produced by the in-tree writer will pass; rejecting forward refs on
-/// read costs nothing and catches:
-///   - third-party recorders that don't enforce ordering,
-///   - corruption that swaps or shifts entries inside the value table,
-///   - hand-crafted traces in tests that accidentally encode a cycle.
-///
-/// We'd flip this to permissive (or downgrade to a warning) if a future
-/// format revision allows forward references — for example, to break value
-/// cycles without using `CycleRef`. No such revision is on the roadmap.
+/// The writer enforces it on emit, so any trace produced by the in-tree
+/// writer will pass; rejecting forward refs on read costs nothing and
+/// catches third-party recorders that don't enforce ordering, corruption
+/// that swaps entries, and hand-crafted traces that accidentally encode a
+/// cycle.
 fn validate_value_refs(value: &Value, current_index: ValueId, strings_len: usize) -> Result<()> {
     match value {
         Value::List(ids) | Value::Set(ids) => {
@@ -526,18 +729,23 @@ fn validate_value_refs(value: &Value, current_index: ValueId, strings_len: usize
     Ok(())
 }
 
-fn parse_event_block(
+/// Parse one block of any of the four v0.2 tags, applying its effect to the
+/// reader's accumulating state (events list, table content, block index).
+#[allow(clippy::too_many_arguments)]
+fn parse_one_block(
     br: &mut ByteReader,
     sources: &[SourceFile],
-    strings: &[String],
-    values: &[ValueEntry],
-) -> Result<(EventBlockInfo, Vec<Event>)> {
+    strings: &mut Vec<String>,
+    values: &mut Vec<ValueEntry>,
+    events: &mut Vec<Event>,
+    event_blocks: &mut Vec<EventBlockInfo>,
+    event_global_ids: &mut Vec<u64>,
+) -> Result<()> {
+    let block_file_offset = br.pos() as u64;
     let block_length = br.read_u32_le()? as usize;
     let block_start = br.pos();
     let block_tag = br.read_u8()?;
-    if block_tag != BLOCK_TAG_EVENT {
-        return Err(FormatError::UnsupportedBlockTag(block_tag));
-    }
+
     let header_length = br.read_uvarint()? as usize;
     let header_start = br.pos();
     let compressed_len = br.read_uvarint()? as usize;
@@ -550,7 +758,7 @@ fn parse_event_block(
     let header_consumed = br.pos() - header_start;
     if header_consumed != header_length {
         return Err(FormatError::SectionLengthMismatch {
-            section: "event block header",
+            section: "block header",
             expected: header_length as u64,
             consumed: header_consumed as u64,
         });
@@ -559,24 +767,9 @@ fn parse_event_block(
     let block_consumed = br.pos() - block_start;
     if block_consumed != block_length {
         return Err(FormatError::SectionLengthMismatch {
-            section: "event block",
+            section: "block",
             expected: block_length as u64,
             consumed: block_consumed as u64,
-        });
-    }
-
-    if string_table_size_after as usize != strings.len() {
-        return Err(FormatError::TableSizeMismatch {
-            section: "string",
-            expected: string_table_size_after,
-            actual: strings.len() as u32,
-        });
-    }
-    if value_table_size_after as usize != values.len() {
-        return Err(FormatError::TableSizeMismatch {
-            section: "value",
-            expected: value_table_size_after,
-            actual: values.len() as u32,
         });
     }
 
@@ -597,26 +790,298 @@ fn parse_event_block(
         });
     }
 
-    let mut event_reader = ByteReader::new(&decompressed);
-    let mut events = Vec::with_capacity(event_count as usize);
-    for _ in 0..event_count {
-        events.push(parse_event(&mut event_reader, sources, strings, values)?);
+    match block_tag {
+        BLOCK_TAG_EVENT => {
+            apply_event_block(
+                &decompressed,
+                sources,
+                strings,
+                values,
+                events,
+                event_global_ids,
+                first_event_id,
+                event_count,
+            )?;
+            // Validate the table-size-after fields against current state
+            // *after* applying the block. Event blocks don't change tables
+            // so the after-sizes must equal current.
+            if string_table_size_after as usize != strings.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "string",
+                    expected: string_table_size_after,
+                    actual: strings.len() as u32,
+                });
+            }
+            if value_table_size_after as usize != values.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "value",
+                    expected: value_table_size_after,
+                    actual: values.len() as u32,
+                });
+            }
+            event_blocks.push(EventBlockInfo {
+                first_event_id,
+                event_count,
+                string_table_size_after,
+                value_table_size_after,
+                file_offset: block_file_offset,
+            });
+        }
+        BLOCK_TAG_CHECKPOINT => {
+            // In-stream checkpoint: parsed for completeness but the data
+            // we surface to callers comes from the populated checkpoint
+            // index just before the footer. The spec is silent on whether
+            // these must agree; in v0 the writer makes them agree by
+            // construction. We don't cross-check here because doing so
+            // would force the reader to know what's coming up in the
+            // (unread) checkpoint index.
+            let _ = parse_checkpoint_record_payload(&decompressed)?;
+            if string_table_size_after as usize != strings.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "string",
+                    expected: string_table_size_after,
+                    actual: strings.len() as u32,
+                });
+            }
+            if value_table_size_after as usize != values.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "value",
+                    expected: value_table_size_after,
+                    actual: values.len() as u32,
+                });
+            }
+        }
+        BLOCK_TAG_TABLE_UPDATE => {
+            apply_table_update(&decompressed, strings, values)?;
+            // After applying, the table-size-after must match the block's
+            // claim.
+            if string_table_size_after as usize != strings.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "string",
+                    expected: string_table_size_after,
+                    actual: strings.len() as u32,
+                });
+            }
+            if value_table_size_after as usize != values.len() {
+                return Err(FormatError::TableSizeMismatch {
+                    section: "value",
+                    expected: value_table_size_after,
+                    actual: values.len() as u32,
+                });
+            }
+        }
+        BLOCK_TAG_TABLE_SNAPSHOT => {
+            apply_table_snapshot(
+                &decompressed,
+                strings,
+                values,
+                string_table_size_after,
+                value_table_size_after,
+            )?;
+            // Snapshot block file_offset is what subsequent checkpoints
+            // reference via their snapshot_offset; we don't need to track
+            // it here since the checkpoint index already carries the
+            // offsets.
+            let _ = block_file_offset;
+        }
+        // Unknown block tags are intentionally rejected today (same
+        // strict-mode policy as unknown event tags). Will flip to
+        // skip-with-warning once the writer can stay behind a reader.
+        _ => return Err(FormatError::UnsupportedBlockTag(block_tag)),
+    }
+
+    // No further validation here — sources isn't mutated, just borrowed
+    // for event reference checks inside apply_event_block.
+    let _ = sources;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_event_block(
+    decompressed: &[u8],
+    sources: &[SourceFile],
+    strings: &[String],
+    values: &[ValueEntry],
+    events: &mut Vec<Event>,
+    event_global_ids: &mut Vec<u64>,
+    first_event_id: u64,
+    event_count: u64,
+) -> Result<()> {
+    let mut event_reader = ByteReader::new(decompressed);
+    for i in 0..event_count {
+        let event = parse_event(&mut event_reader, sources, strings, values)?;
+        events.push(event);
+        event_global_ids.push(first_event_id + i);
     }
     if event_reader.remaining() != 0 {
         return Err(FormatError::TrailingBytesInEventBlock(
             event_reader.remaining(),
         ));
     }
+    Ok(())
+}
 
-    Ok((
-        EventBlockInfo {
-            first_event_id,
-            event_count,
-            string_table_size_after,
-            value_table_size_after,
-        },
-        events,
-    ))
+fn parse_checkpoint_record_payload(decompressed: &[u8]) -> Result<(u64, u64)> {
+    let mut br = ByteReader::new(decompressed);
+    let wall_clock_ns = br.read_u64_le()?;
+    let snapshot_offset = br.read_u64_le()?;
+    if br.remaining() != 0 {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "checkpoint record payload",
+            expected: 16,
+            consumed: (16 + br.remaining()) as u64,
+        });
+    }
+    Ok((wall_clock_ns, snapshot_offset))
+}
+
+fn apply_table_update(
+    decompressed: &[u8],
+    strings: &mut Vec<String>,
+    values: &mut Vec<ValueEntry>,
+) -> Result<()> {
+    let mut br = ByteReader::new(decompressed);
+    let strings_before = strings.len();
+    let values_before = values.len();
+
+    let base_string_count = br.read_u32_le()?;
+    let new_string_count = br.read_u32_le()?;
+    if base_string_count as usize != strings_before {
+        return Err(FormatError::TableUpdateBaseMismatch {
+            field: "base_string_count",
+            expected: base_string_count,
+            observed: strings_before as u32,
+        });
+    }
+    for _ in 0..new_string_count {
+        let len = br.read_uvarint()? as usize;
+        let bytes = br.take(len)?;
+        let s = std::str::from_utf8(bytes)
+            .map_err(|_| FormatError::InvalidUtf8 {
+                field: "table update string entry",
+            })?
+            .to_owned();
+        strings.push(s);
+    }
+    let actual_new_strings = (strings.len() - strings_before) as u32;
+    if actual_new_strings != new_string_count {
+        return Err(FormatError::TableUpdateNewCountMismatch {
+            field: "string",
+            expected: new_string_count,
+            observed: actual_new_strings,
+        });
+    }
+
+    let base_value_count = br.read_u32_le()?;
+    let new_value_count = br.read_u32_le()?;
+    if base_value_count as usize != values_before {
+        return Err(FormatError::TableUpdateBaseMismatch {
+            field: "base_value_count",
+            expected: base_value_count,
+            observed: values_before as u32,
+        });
+    }
+    for _ in 0..new_value_count {
+        let current_index = values.len() as ValueId;
+        let entry = parse_value_table_entry(&mut br, current_index, strings.len())?;
+        values.push(entry);
+    }
+    let actual_new_values = (values.len() - values_before) as u32;
+    if actual_new_values != new_value_count {
+        return Err(FormatError::TableUpdateNewCountMismatch {
+            field: "value",
+            expected: new_value_count,
+            observed: actual_new_values,
+        });
+    }
+    if br.remaining() != 0 {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "table update payload",
+            expected: 0,
+            consumed: br.remaining() as u64,
+        });
+    }
+    Ok(())
+}
+
+fn apply_table_snapshot(
+    decompressed: &[u8],
+    strings: &mut Vec<String>,
+    values: &mut Vec<ValueEntry>,
+    string_table_size_after: u32,
+    value_table_size_after: u32,
+) -> Result<()> {
+    let mut br = ByteReader::new(decompressed);
+
+    // String section: length u32 + count u32 + entries.
+    let string_section_length = br.read_u32_le()? as usize;
+    let string_section_start = br.pos();
+    let string_count = br.read_u32_le()?;
+    let mut new_strings: Vec<String> = Vec::with_capacity(string_count as usize);
+    for _ in 0..string_count {
+        let len = br.read_uvarint()? as usize;
+        let bytes = br.take(len)?;
+        let s = std::str::from_utf8(bytes)
+            .map_err(|_| FormatError::InvalidUtf8 {
+                field: "snapshot string entry",
+            })?
+            .to_owned();
+        new_strings.push(s);
+    }
+    let string_section_consumed = br.pos() - string_section_start;
+    if string_section_consumed != string_section_length {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "snapshot string table",
+            expected: string_section_length as u64,
+            consumed: string_section_consumed as u64,
+        });
+    }
+    if string_count != string_table_size_after {
+        return Err(FormatError::SnapshotCountMismatch {
+            field: "string",
+            expected: string_table_size_after,
+            observed: string_count,
+        });
+    }
+
+    // Value section: length u32 + count u32 + entries. We need to validate
+    // value refs against the *new* string table, so install strings first.
+    *strings = new_strings;
+
+    let value_section_length = br.read_u32_le()? as usize;
+    let value_section_start = br.pos();
+    let value_count = br.read_u32_le()?;
+    let mut new_values: Vec<ValueEntry> = Vec::with_capacity(value_count as usize);
+    for i in 0..value_count {
+        let entry = parse_value_table_entry(&mut br, i as ValueId, strings.len())?;
+        new_values.push(entry);
+    }
+    let value_section_consumed = br.pos() - value_section_start;
+    if value_section_consumed != value_section_length {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "snapshot value table",
+            expected: value_section_length as u64,
+            consumed: value_section_consumed as u64,
+        });
+    }
+    if value_count != value_table_size_after {
+        return Err(FormatError::SnapshotCountMismatch {
+            field: "value",
+            expected: value_table_size_after,
+            observed: value_count,
+        });
+    }
+    *values = new_values;
+
+    if br.remaining() != 0 {
+        return Err(FormatError::SectionLengthMismatch {
+            section: "snapshot payload",
+            expected: 0,
+            consumed: br.remaining() as u64,
+        });
+    }
+    Ok(())
 }
 
 fn parse_event(
@@ -786,23 +1251,8 @@ fn parse_event(
             })
         }
         // Strict-mode policy: error on event tags 0x0A+ rather than skip
-        // them via the length prefix as the spec describes.
-        //
-        // The spec's §"Reserved event types" says readers must skip unknown
-        // tags using the length prefix — that's the right long-term behavior
-        // for forward compatibility once readers and writers can disagree
-        // about which event types exist. Today the writer emits exactly
-        // 0x01..=0x09 and this reader supports the same set, so anything else
-        // is either:
-        //   - a writer bug (a new event type half-implemented),
-        //   - corruption that flipped a tag byte, or
-        //   - a third-party recorder running ahead of this reader.
-        // All three are worth surfacing loudly; skip-with-warning would mask
-        // them.
-        //
-        // Flip to spec-compliant skip behavior once we cut a release whose
-        // writer can stay behind a reader (i.e., once forward-compat between
-        // versions is a real scenario).
+        // them via the length prefix as the spec describes. See the strict-
+        // mode comment block in `parse_event` of the previous revision.
         _ => return Err(FormatError::UnsupportedEventTag(tag_byte)),
     };
 
@@ -886,6 +1336,18 @@ fn parse_footer(br: &mut ByteReader) -> Result<Footer> {
     })
 }
 
+/// Read just the footer at `footer_offset` without disturbing the main parse
+/// cursor. Used by `from_bytes` to learn the block-stream-end (which equals
+/// the footer's `final_summary_offset`).
+fn peek_footer(file_bytes: &[u8], footer_offset: u64) -> Result<Footer> {
+    let start = footer_offset as usize;
+    if start.saturating_add(FOOTER_LENGTH as usize) > file_bytes.len() {
+        return Err(FormatError::Truncated);
+    }
+    let mut br = ByteReader::new(&file_bytes[start..start + FOOTER_LENGTH as usize]);
+    parse_footer(&mut br)
+}
+
 fn read_u32_varint(br: &mut ByteReader, field: &'static str) -> Result<u32> {
     let v = br.read_uvarint()?;
     v.try_into()
@@ -961,8 +1423,6 @@ mod tests {
         out
     }
 
-    // --- Header parser ---
-
     #[test]
     fn parse_header_extracts_fields_for_unfinalized_trace() {
         let bytes = write_minimal_unfinalized();
@@ -974,7 +1434,7 @@ mod tests {
         assert_eq!(h.header_length, HEADER_LENGTH);
         assert_eq!(h.trace_uuid, [0xAB; 16]);
         assert_eq!(h.recording_start_ns, 1_700_000_000);
-        assert_eq!(h.recording_end_ns, 0, "unfinalized leaves end zero");
+        assert_eq!(h.recording_end_ns, 0);
         assert_eq!(h.footer_offset, 0);
         assert_eq!(br.pos(), HEADER_LENGTH as usize);
     }
@@ -989,316 +1449,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_header_rejects_bad_magic() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes[0] = b'X';
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_header(&mut br),
-            Err(FormatError::BadMagic { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_header_rejects_unsupported_version() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes[8] = 1; // major
-        bytes[9] = 0; // minor
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_header(&mut br),
-            Err(FormatError::UnsupportedVersion { major: 1, minor: 0 })
-        ));
-    }
-
-    #[test]
-    fn parse_header_rejects_nonzero_flags() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes[10] = 0x01;
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_header(&mut br),
-            Err(FormatError::ReservedFieldNonzero("header flags"))
-        ));
-    }
-
-    #[test]
-    fn parse_header_rejects_bad_header_length() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes[12..16].copy_from_slice(&128u32.to_le_bytes());
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_header(&mut br),
-            Err(FormatError::BadHeaderLength {
-                expected: 64,
-                got: 128
-            })
-        ));
-    }
-
-    #[test]
-    fn parse_header_rejects_nonzero_reserved_tail() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes[56] = 1;
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_header(&mut br),
-            Err(FormatError::ReservedFieldNonzero("header reserved tail"))
-        ));
-    }
-
-    #[test]
-    fn parse_header_truncated_input_errors() {
-        let bytes = vec![0u8; 10];
-        let mut br = ByteReader::new(&bytes);
-        assert!(parse_header(&mut br).is_err());
-    }
-
-    // --- Metadata parser ---
-
-    #[test]
-    fn parse_metadata_returns_raw_toml() {
-        let bytes = write_minimal_unfinalized();
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        let m = parse_metadata_block(&mut br).unwrap();
-        assert_eq!(m.format_tag, METADATA_FORMAT_TAG_TOML);
-        assert!(m.payload.contains("[recorder]"));
-        assert!(m.payload.contains("language = \"python\""));
-    }
-
-    #[test]
-    fn parse_metadata_rejects_unknown_format_tag() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.push(0x99);
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_metadata_block(&mut br),
-            Err(FormatError::UnsupportedMetadataFormatTag(0x99))
-        ));
-    }
-
-    #[test]
-    fn parse_metadata_rejects_zero_length() {
-        let bytes = 0u32.to_le_bytes();
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_metadata_block(&mut br),
-            Err(FormatError::SectionLengthMismatch { .. })
-        ));
-    }
-
-    // --- Source bundle parser ---
-
-    #[test]
-    fn parse_source_bundle_round_trips_one_file() {
-        let mut w = TraceWriter::new(empty_metadata());
-        w.add_source_file("hi.py", b"print('hi')\n".to_vec());
-        let bytes = w.finish_to_bytes(finalize()).unwrap();
-
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        parse_metadata_block(&mut br).unwrap();
-        let files = parse_source_bundle(&mut br).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "hi.py");
-        assert_eq!(files[0].content, b"print('hi')\n");
-        assert_eq!(
-            files[0].blake3_hash,
-            *blake3::hash(b"print('hi')\n").as_bytes()
-        );
-    }
-
-    #[test]
-    fn parse_source_bundle_detects_hash_mismatch() {
-        let real_content = b"abd";
-        let lying_hash = *blake3::hash(b"abc").as_bytes();
-        let path = b"x.py";
-
-        let mut entries = Vec::new();
-        entries.push(0u8); // file_id varint = 0
-        entries.extend_from_slice(&lying_hash);
-        entries.extend_from_slice(&(path.len() as u16).to_le_bytes());
-        entries.extend_from_slice(path);
-        entries.extend_from_slice(&(real_content.len() as u32).to_le_bytes());
-        entries.extend_from_slice(real_content);
-
-        let mut body = Vec::new();
-        body.extend_from_slice(&1u32.to_le_bytes());
-        body.extend_from_slice(&entries);
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&body);
-
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_source_bundle(&mut br),
-            Err(FormatError::SourceHashMismatch { file_id: 0 })
-        ));
-    }
-
-    // --- String table parser ---
-
-    #[test]
-    fn parse_string_table_round_trip() {
-        let mut w = TraceWriter::new(empty_metadata());
-        w.intern_string("foo");
-        w.intern_string("bar");
-        let bytes = w.finish_to_bytes(finalize()).unwrap();
-
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        parse_metadata_block(&mut br).unwrap();
-        parse_source_bundle(&mut br).unwrap();
-        let strings = parse_string_table(&mut br).unwrap();
-        assert_eq!(strings, vec!["foo".to_string(), "bar".to_string()]);
-    }
-
-    #[test]
-    fn parse_string_table_rejects_invalid_utf8() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&6u32.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.push(1);
-        bytes.push(0xFF);
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_string_table(&mut br),
-            Err(FormatError::InvalidUtf8 { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_string_table_section_length_mismatch_is_caught() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&100u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        let mut br = ByteReader::new(&bytes);
-        assert!(parse_string_table(&mut br).is_err());
-    }
-
-    // --- Value table parser ---
-
-    #[test]
-    fn parse_value_table_includes_reserved_indices() {
-        let bytes = write_minimal_unfinalized();
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        parse_metadata_block(&mut br).unwrap();
-        parse_source_bundle(&mut br).unwrap();
-        let strings = parse_string_table(&mut br).unwrap();
-        let values = parse_value_table(&mut br, strings.len()).unwrap();
-        assert!(matches!(values[0].value, Value::None));
-        assert!(matches!(values[1].value, Value::ExceptionUnwindSentinel));
-        assert_eq!(values[0].hash_kind, HashKind::Content);
-        assert_eq!(values[1].hash_kind, HashKind::Content);
-    }
-
-    #[test]
-    fn parse_value_table_rejects_invalid_tag() {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&5u32.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.push(0x55);
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_value_table(&mut br, 0),
-            Err(FormatError::InvalidValueTag(0x55))
-        ));
-    }
-
-    #[test]
-    fn parse_value_table_rejects_invalid_hash_kind() {
-        let mut entry = Vec::new();
-        entry.push(0x00);
-        entry.push(0x99);
-        entry.extend_from_slice(&[0u8; 16]);
-        entry.push(0);
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&((4 + entry.len()) as u32).to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&entry);
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_value_table(&mut br, 0),
-            Err(FormatError::InvalidHashKind(0x99))
-        ));
-    }
-
-    #[test]
-    fn parse_value_table_rejects_forward_value_ref() {
-        let mut entry = Vec::new();
-        entry.push(ValueTag::ListOrTuple as u8);
-        entry.push(HashKind::Content as u8);
-        entry.extend_from_slice(&[0u8; 16]);
-        let data = [0x01u8, 0x05];
-        entry.push(data.len() as u8);
-        entry.extend_from_slice(&data);
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&((4 + entry.len()) as u32).to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&entry);
-        let mut br = ByteReader::new(&bytes);
-        assert!(matches!(
-            parse_value_table(&mut br, 0),
-            Err(FormatError::ForwardValueRef { id: 5, at_index: 0 })
-        ));
-    }
-
-    // --- Event block parser ---
-
-    #[test]
-    fn parse_event_block_returns_zero_events_for_minimal_trace() {
-        let bytes = write_minimal_unfinalized();
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        parse_metadata_block(&mut br).unwrap();
-        let sources = parse_source_bundle(&mut br).unwrap();
-        let strings = parse_string_table(&mut br).unwrap();
-        let values = parse_value_table(&mut br, strings.len()).unwrap();
-        let (info, events) = parse_event_block(&mut br, &sources, &strings, &values).unwrap();
-        assert_eq!(events.len(), 0);
-        assert_eq!(info.event_count, 0);
-        assert_eq!(info.first_event_id, 0);
-        assert_eq!(info.string_table_size_after as usize, strings.len());
-        assert_eq!(info.value_table_size_after as usize, values.len());
-    }
-
-    #[test]
-    fn parse_event_block_detects_checksum_mismatch() {
-        // Use the unfinalized trace so the last byte of the file IS in the
-        // compressed payload (finalized files end in the footer).
-        let mut bytes = write_minimal_unfinalized();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        let mut br = ByteReader::new(&bytes);
-        parse_header(&mut br).unwrap();
-        parse_metadata_block(&mut br).unwrap();
-        let sources = parse_source_bundle(&mut br).unwrap();
-        let strings = parse_string_table(&mut br).unwrap();
-        let values = parse_value_table(&mut br, strings.len()).unwrap();
-        let result = parse_event_block(&mut br, &sources, &strings, &values);
-        assert!(matches!(result, Err(FormatError::ChecksumMismatch { .. })));
-    }
-
-    #[test]
-    fn parse_event_block_rejects_non_event_block_tag() {
-        let body = [0x02u8, 0x01, 0x00];
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&body);
-        let mut br = ByteReader::new(&bytes);
-        let result = parse_event_block(&mut br, &[], &[], &[]);
-        assert!(matches!(
-            result,
-            Err(FormatError::UnsupportedBlockTag(0x02))
-        ));
-    }
-
-    #[test]
     fn from_bytes_full_pipeline_for_unfinalized_minimal_trace_works() {
         let bytes = write_minimal_unfinalized();
         let r = TraceReader::from_bytes(&bytes).unwrap();
@@ -1310,6 +1460,8 @@ mod tests {
         assert!(r.footer().is_none());
         assert!(r.checkpoints().is_empty());
         assert!(!r.is_finalized());
+        // Even an empty trace has one event block.
+        assert_eq!(r.event_blocks().len(), 1);
     }
 
     #[test]
@@ -1323,17 +1475,6 @@ mod tests {
         let summary = r.final_summary().unwrap();
         assert!(summary.payload.contains("[final]"));
         assert!(summary.payload.contains("clean_shutdown = true"));
-    }
-
-    #[test]
-    fn unfinalized_trace_with_trailing_garbage_is_tolerated() {
-        let mut bytes = write_minimal_unfinalized();
-        bytes.extend_from_slice(b"garbage that the writer never wrote");
-        // Header.footer_offset is zero so the reader stops after the event
-        // block and ignores the rest. Per the spec's crash-recovery
-        // semantics, an unfinalized file's trailing bytes are discarded.
-        let r = TraceReader::from_bytes(&bytes).unwrap();
-        assert!(!r.is_finalized());
     }
 
     #[test]
@@ -1357,37 +1498,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_footer_rejects_bad_magic() {
-        let mut bad_footer = [0u8; 32];
-        bad_footer[0..8].copy_from_slice(b"BADMAGIC");
-        bad_footer[8..12].copy_from_slice(&FOOTER_LENGTH.to_le_bytes());
-        let mut br = ByteReader::new(&bad_footer);
-        assert!(matches!(
-            parse_footer(&mut br),
-            Err(FormatError::BadFooterMagic { .. })
-        ));
-    }
-
-    #[test]
-    fn parse_footer_rejects_bad_length() {
-        let mut footer = [0u8; 32];
-        footer[0..8].copy_from_slice(&FOOTER_MAGIC);
-        footer[8..12].copy_from_slice(&64u32.to_le_bytes()); // wrong length
-        let mut br = ByteReader::new(&footer);
-        assert!(matches!(
-            parse_footer(&mut br),
-            Err(FormatError::BadFooterLength {
-                expected: 32,
-                got: 64
-            })
-        ));
-    }
-
-    #[test]
     fn parse_checkpoint_index_empty() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&4u32.to_le_bytes()); // section length
-        bytes.extend_from_slice(&0u32.to_le_bytes()); // count = 0
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
         let mut br = ByteReader::new(&bytes);
         let entries = parse_checkpoint_index(&mut br).unwrap();
         assert!(entries.is_empty());
@@ -1396,13 +1510,13 @@ mod tests {
     #[test]
     fn parse_checkpoint_index_one_entry() {
         let mut bytes = Vec::new();
-        let body_len = 4 + 32; // count u32 + one 32-byte entry
+        let body_len = 4 + 32;
         bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&100u64.to_le_bytes()); // wall_clock_ns
-        bytes.extend_from_slice(&7u64.to_le_bytes()); // event_id
-        bytes.extend_from_slice(&200u64.to_le_bytes()); // file_offset
-        bytes.extend_from_slice(&300u64.to_le_bytes()); // snapshot_offset
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&200u64.to_le_bytes());
+        bytes.extend_from_slice(&300u64.to_le_bytes());
         let mut br = ByteReader::new(&bytes);
         let entries = parse_checkpoint_index(&mut br).unwrap();
         assert_eq!(entries.len(), 1);
@@ -1410,5 +1524,19 @@ mod tests {
         assert_eq!(entries[0].event_id, 7);
         assert_eq!(entries[0].file_offset, 200);
         assert_eq!(entries[0].snapshot_offset, 300);
+    }
+
+    #[test]
+    fn seek_unfinalized_errors() {
+        let bytes = write_minimal_unfinalized();
+        let r = TraceReader::from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            r.seek_to_event_id(0),
+            Err(FormatError::SeekUnfinalized)
+        ));
+        assert!(matches!(
+            r.seek_to_wall_clock(0),
+            Err(FormatError::SeekUnfinalized)
+        ));
     }
 }

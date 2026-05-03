@@ -318,6 +318,8 @@ A checkpoint is metadata that lets a reader seek into the trace efficiently. Che
 
 Other information (event ID, table sizes, file offset) is in the block header itself, not duplicated in the payload.
 
+**TODO(v0.3):** the spec says "the first snapshot in the file is logically the initial string and value tables (after the header)," but the on-disk encoding of the initial tables and a snapshot block (tag `0x04`) are different (initial = two raw length-prefixed sections; snapshot = a compressed block-tagged payload), so a reader can't decode them uniformly. The current writer/reader pair uses **`snapshot_offset == 0` as a sentinel meaning "use the initial string and value tables that follow the file header"** — readers special-case zero rather than trying to parse a snapshot block at offset 0. This sentinel value applies both to the checkpoint record payload above and to the same-named field in checkpoint index entries. Codify this sentinel (or alternatively require the writer to emit an explicit snapshot block right after the initial value table so the offset always points at a real snapshot block). Surfaced by the writer/reader implementation.
+
 #### Table update payload (tag 0x03)
 
 Incremental additions to the string and value tables since the last update or snapshot.
@@ -343,6 +345,10 @@ Incremental additions to the string and value tables since the last update or sn
 Same logic for values.
 
 The recorder emits table updates immediately before any event block that references newly-introduced strings or values. This guarantees that an event never references an ID that doesn't yet exist in the table.
+
+**TODO(v0.3):** the spec doesn't say whether the writer must emit an *empty* table update block (one whose `new_string_count` and `new_value_count` are both zero) before an event block when no new entries have been interned since the last update. The current writer **skips** empty updates as pure overhead; the current reader correspondingly does **not** assume a 1:1 correspondence between event blocks and table updates — an event block that doesn't reference any newly-introduced strings or values has no preceding update. Codify "writers MUST NOT emit empty table updates; readers MUST NOT assume one update per event block." Surfaced by the writer/reader implementation.
+
+**TODO(v0.3):** the spec also doesn't say whether the snapshot interval ("default every 100 checkpoints") is counted since file start or since the last snapshot. The current writer counts **since the last snapshot** so snapshot decisions are locally determined rather than dependent on the full checkpoint history. Codify the choice. Surfaced by the writer implementation.
 
 #### Table snapshot payload (tag 0x04)
 
@@ -406,7 +412,7 @@ note_events = 0
 
 If `clean_shutdown = false` or the final summary is missing entirely, the trace was interrupted. The header's `recording_end` field will be zero in this case. Readers handle this gracefully — events read up to the last valid block are fully usable; the summary just isn't available.
 
-**TODO(v0.3):** the spec doesn't define what `total_blocks` counts. The §"Event blocks" section only describes `0x01..=0x04` block tags, but the final summary, checkpoint index, and footer aren't block-tagged at all — they're standalone sections after the block stream. The current writer counts the final summary as one of the `total_blocks` (so an empty trace finalizes with `total_blocks = 2`: one event block + one summary). Either codify "blocks tagged 0x01-0x04 + the final summary" or scope `total_blocks` strictly to tagged blocks. Surfaced by the writer implementation.
+**TODO(v0.3):** the spec doesn't define what `total_blocks` counts. The §"Event blocks" section describes `0x01..=0x04` block tags; the final summary, checkpoint index, and footer aren't block-tagged at all. The current writer counts every block emitted into the file (event 0x01 + checkpoint 0x02 + table update 0x03 + table snapshot 0x04) plus the final summary itself — so an empty trace finalizes with `total_blocks = 2` (one event block + one summary), and a trace with checkpoints/updates/snapshots adds one to that count for each. Either codify this all-blocks-plus-summary interpretation or rename the field (e.g., `total_event_blocks`) to scope it strictly to `0x01` blocks. Surfaced by the writer implementation.
 
 ### Checkpoint index
 

@@ -12,11 +12,12 @@
 use std::io::Cursor;
 
 use hindsight_format::{
-    Argument, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, Event,
+    Argument, BLOCK_TAG_CHECKPOINT, BLOCK_TAG_EVENT, BLOCK_TAG_TABLE_SNAPSHOT,
+    BLOCK_TAG_TABLE_UPDATE, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, Event,
     ExceptionRaised, ExcludedFunction, FOOTER_LENGTH, Finalization, FormatError, FrameSnapshot,
     FrameSwitch, FrameSwitchReason, FunctionEntry, FunctionExit, HEADER_LENGTH, HashKind, Kwarg,
     LineDelta, Local, Metadata, NONE_VALUE_ID, Note, ProgramInfo, RecorderInfo, RecordingInfo,
-    ScopeBoundary, ScopeConfig, ScopeResolution, TraceReader, TraceWriter, Value,
+    ScopeBoundary, ScopeConfig, ScopeResolution, TraceReader, TraceWriter, Value, WriterConfig,
 };
 
 const FILE_OFFSET_HEADER_LEN: usize = 12;
@@ -109,8 +110,13 @@ fn round_trip_finalized_empty_trace() {
     ));
 
     assert!(r.events().is_empty());
-    assert_eq!(r.event_block_info().first_event_id, 0);
-    assert_eq!(r.event_block_info().event_count, 0);
+    assert_eq!(
+        r.event_blocks().len(),
+        1,
+        "even an empty trace has one event block"
+    );
+    assert_eq!(r.event_blocks()[0].first_event_id, 0);
+    assert_eq!(r.event_blocks()[0].event_count, 0);
 
     assert!(r.is_finalized());
     let summary = r.final_summary().expect("finalized trace has summary");
@@ -287,8 +293,13 @@ fn round_trip_worked_example_events() {
     let bytes = finalize(w);
     let r = TraceReader::from_bytes(&bytes).unwrap();
 
-    assert_eq!(r.event_block_info().event_count, 5);
-    assert_eq!(r.event_block_info().first_event_id, 0);
+    assert_eq!(
+        r.event_blocks().len(),
+        1,
+        "5 events fit comfortably in one block"
+    );
+    assert_eq!(r.event_blocks()[0].event_count, 5);
+    assert_eq!(r.event_blocks()[0].first_event_id, 0);
 
     let events = r.events();
     assert_eq!(events.len(), 5);
@@ -833,7 +844,11 @@ fn nonexistent_source_file_id_in_function_entry() {
         }],
     };
     w.write_function_entry(entry).unwrap();
-    let bytes = finalize(w);
+    // Use an unfinalized trace for tampering: shifting bundle bytes would
+    // invalidate the footer offsets in a finalized file, causing the
+    // reader's footer pre-peek to fail before it reaches the
+    // FUNCTION_ENTRY's reference. Unfinalized has no footer to confuse.
+    let bytes = unfinalized(w);
 
     TraceReader::from_bytes(&bytes).unwrap();
 
@@ -884,13 +899,23 @@ fn nonexistent_value_id_in_function_exit() {
         return_value: v,
     })
     .unwrap();
-    let bytes = finalize(w);
+    // Same rationale as the source-file-id tampering test above: shifting
+    // value-table bytes would invalidate the footer's offsets in a finalized
+    // file, so the tamper-the-table test runs against an unfinalized trace.
+    let bytes = unfinalized(w);
 
     let bad = corrupt_value_table_size(&bytes);
     let result = TraceReader::from_bytes(&bad);
+    // Either error is acceptable: the value-ref check inside event parsing
+    // fires first (UnknownValueId), but if the event block lacks a
+    // referencing event the table-size-after cross-check (TableSizeMismatch)
+    // would catch it. Both prove the corruption is rejected.
     assert!(
-        matches!(result, Err(FormatError::TableSizeMismatch { .. })),
-        "expected TableSizeMismatch, got {result:?}"
+        matches!(
+            result,
+            Err(FormatError::UnknownValueId(_)) | Err(FormatError::TableSizeMismatch { .. })
+        ),
+        "expected UnknownValueId or TableSizeMismatch, got {result:?}"
     );
 }
 
@@ -926,9 +951,22 @@ fn header_footer_offset_pointing_past_end_is_detected() {
     bytes[HEADER_OFFSET_FOOTER_OFFSET..HEADER_OFFSET_FOOTER_OFFSET + 8]
         .copy_from_slice(&bogus_offset.to_le_bytes());
     let result = TraceReader::from_bytes(&bytes);
+    // Either form of "footer offset is invalid" is acceptable: the reader
+    // peeks the footer at the claimed offset to learn where the block
+    // stream ends. A bogus offset can land on bytes that look like a
+    // truncated/garbage footer (BadFooterMagic / BadFooterLength /
+    // Truncated) or, if it survives the peek, surface as the cross-check
+    // mismatch (HeaderFooterOffsetMismatch). The test's intent is only to
+    // confirm the reader rejects the trace.
     assert!(
-        matches!(result, Err(FormatError::HeaderFooterOffsetMismatch { .. })),
-        "expected HeaderFooterOffsetMismatch, got {result:?}"
+        matches!(
+            result,
+            Err(FormatError::HeaderFooterOffsetMismatch { .. })
+                | Err(FormatError::BadFooterMagic { .. })
+                | Err(FormatError::BadFooterLength { .. })
+                | Err(FormatError::Truncated)
+        ),
+        "expected a footer-offset failure, got {result:?}"
     );
 }
 
@@ -989,4 +1027,593 @@ fn corrupt_value_table_size(bytes: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&bytes[after_value_table..]);
     out
+}
+
+/// Walks the post-prelude block stream of a finalized trace and counts the
+/// number of blocks of each tag emitted into the file. Used by
+/// multi-block round-trip tests.
+fn count_blocks_by_tag(bytes: &[u8]) -> std::collections::HashMap<u8, usize> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<u8, usize> = HashMap::new();
+
+    // Locate the start of the block stream and the end (= final summary
+    // offset, read from the footer).
+    let mut off = HEADER_LENGTH as usize;
+    off += metadata_total_len(bytes);
+    off += source_bundle_total_len(bytes, off);
+    off += length_prefixed_total_len(bytes, off);
+    off += length_prefixed_total_len(bytes, off);
+    let block_stream_start = off;
+
+    let footer_offset = u64::from_le_bytes(
+        bytes[HEADER_OFFSET_FOOTER_OFFSET..HEADER_OFFSET_FOOTER_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let footer_start = footer_offset as usize;
+    let final_summary_offset = u64::from_le_bytes(
+        bytes[footer_start + 20..footer_start + 28]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+
+    let mut pos = block_stream_start;
+    while pos < final_summary_offset {
+        let block_len =
+            u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+        let tag = bytes[pos + 4];
+        *counts.entry(tag).or_insert(0) += 1;
+        pos += 4 + block_len as usize;
+    }
+    counts
+}
+
+// ---------- multi-block / table updates / snapshots / checkpoints ----------
+
+/// Build a writer with a tiny event-block size so even short traces split
+/// across multiple blocks. Other thresholds left at defaults — for the
+/// short tests they won't trigger checkpoints.
+fn small_blocks_config() -> WriterConfig {
+    WriterConfig {
+        event_block_size_bytes: 32,
+        ..WriterConfig::default()
+    }
+}
+
+#[test]
+fn default_config_small_trace_emits_single_event_block() {
+    // Backward-compat shape check: a trace small enough to fit under the
+    // default 32 KiB threshold produces exactly one event block, zero
+    // checkpoint/update/snapshot blocks. (If this ever fires for new
+    // reasons, we've inadvertently broken byte shape for the common case.)
+    let bytes = finalize(TraceWriter::new(fixture_metadata()));
+    let counts = count_blocks_by_tag(&bytes);
+    assert_eq!(counts.get(&BLOCK_TAG_EVENT).copied().unwrap_or(0), 1);
+    assert_eq!(counts.get(&BLOCK_TAG_CHECKPOINT).copied().unwrap_or(0), 0);
+    assert_eq!(counts.get(&BLOCK_TAG_TABLE_UPDATE).copied().unwrap_or(0), 0);
+    assert_eq!(
+        counts.get(&BLOCK_TAG_TABLE_SNAPSHOT).copied().unwrap_or(0),
+        0
+    );
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    assert_eq!(r.event_blocks().len(), 1);
+    // total_blocks counts event + final summary.
+    assert!(
+        r.final_summary()
+            .unwrap()
+            .payload
+            .contains("total_blocks = 2"),
+    );
+}
+
+#[test]
+fn small_block_size_splits_events_across_multiple_blocks() {
+    let mut w = TraceWriter::with_config(fixture_metadata(), small_blocks_config());
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let func = w.intern_string("f");
+
+    // Each FUNCTION_ENTRY with no args is a few bytes; with the 32-byte
+    // threshold we'll flush every couple of events.
+    let n_events = 30;
+    for i in 0..n_events {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: i,
+            frame_id: i,
+            function_id: func,
+            source_file_id: file_id,
+            line: 1 + (i as u32 % 100),
+            args: vec![],
+        })
+        .unwrap();
+    }
+
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    assert_eq!(r.events().len(), n_events as usize);
+    let blocks = r.event_blocks();
+    assert!(
+        blocks.len() > 1,
+        "expected multi-block split; got {} blocks",
+        blocks.len()
+    );
+
+    // Block boundaries are consistent: each block's first_event_id +
+    // event_count equals the next block's first_event_id, and totals match.
+    let mut expected_id = 0u64;
+    let mut total_events = 0u64;
+    for blk in blocks {
+        assert_eq!(blk.first_event_id, expected_id);
+        expected_id += blk.event_count;
+        total_events += blk.event_count;
+    }
+    assert_eq!(total_events as usize, r.events().len());
+}
+
+#[test]
+fn intern_after_first_flush_emits_table_update_block() {
+    // Force a flush after a single event by setting the threshold very low.
+    // Then intern a new string and emit another event — the second event
+    // block must be preceded by a table update block.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1, // force a flush after every event
+            ..WriterConfig::default()
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f1 = w.intern_string("f1");
+
+    w.write_function_entry(FunctionEntry {
+        timestamp_delta_ns: 0,
+        frame_id: 0,
+        function_id: f1,
+        source_file_id: file_id,
+        line: 1,
+        args: vec![],
+    })
+    .unwrap();
+
+    // Now intern a new string after the first event has flushed.
+    let f2 = w.intern_string("f2");
+    w.write_function_entry(FunctionEntry {
+        timestamp_delta_ns: 1,
+        frame_id: 1,
+        function_id: f2,
+        source_file_id: file_id,
+        line: 2,
+        args: vec![],
+    })
+    .unwrap();
+
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    assert!(
+        counts.get(&BLOCK_TAG_TABLE_UPDATE).copied().unwrap_or(0) >= 1,
+        "expected at least one table update block, got counts {counts:?}"
+    );
+
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    assert_eq!(r.events().len(), 2);
+    assert_eq!(r.strings(), &["f1".to_string(), "f2".to_string()]);
+}
+
+#[test]
+fn no_table_updates_when_nothing_new_interned_after_first_flush() {
+    // Same forced-flush scenario, but interning happens entirely *before*
+    // any events are recorded. The reader's "no 1:1 between event and
+    // update blocks" expectation: zero update blocks, multiple event
+    // blocks.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            ..WriterConfig::default()
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+
+    for i in 0..5u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: i,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    assert_eq!(
+        counts.get(&BLOCK_TAG_TABLE_UPDATE).copied().unwrap_or(0),
+        0,
+        "no update blocks when nothing new interned after flush; counts {counts:?}",
+    );
+    assert!(counts.get(&BLOCK_TAG_EVENT).copied().unwrap_or(0) > 1);
+}
+
+#[test]
+fn checkpoints_emitted_at_event_count_interval() {
+    // Force checkpoints every 2 events; default event_block_size keeps each
+    // recording-loop iteration in one block boundary check.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1, // flush per event so checkpoint check fires often
+            checkpoint_interval_events: 2,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: u32::MAX, // suppress snapshots
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..6u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    let n_checkpoints = counts.get(&BLOCK_TAG_CHECKPOINT).copied().unwrap_or(0);
+    // 6 events / 2 per checkpoint = 3 checkpoints.
+    assert_eq!(n_checkpoints, 3, "block counts: {counts:?}");
+
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    assert_eq!(r.checkpoints().len(), 3);
+    // Each checkpoint's event_id is non-decreasing and bounded by event count.
+    let mut prev = 0u64;
+    for cp in r.checkpoints() {
+        assert!(cp.event_id >= prev);
+        prev = cp.event_id;
+    }
+    assert!(prev <= r.events().len() as u64);
+}
+
+#[test]
+fn checkpoints_emitted_at_wall_clock_interval() {
+    // Use ns-only trigger; events have small per-event deltas so we can hit
+    // the threshold at known points.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: u64::MAX, // suppress event-count trigger
+            checkpoint_interval_ns: 100,
+            snapshot_interval_checkpoints: u32::MAX,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    // Each event adds 50ns. After 2 events = 100ns → checkpoint.
+    for i in 0..6u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 50,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    assert_eq!(
+        counts.get(&BLOCK_TAG_CHECKPOINT).copied().unwrap_or(0),
+        3,
+        "expected 3 checkpoints (every 100ns over 6×50ns), counts {counts:?}",
+    );
+}
+
+#[test]
+fn snapshots_emitted_every_n_checkpoints() {
+    // Checkpoints every 1 event; snapshot every 2 checkpoints.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 1,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: 2,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..6u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    let n_checkpoints = counts.get(&BLOCK_TAG_CHECKPOINT).copied().unwrap_or(0);
+    let n_snapshots = counts.get(&BLOCK_TAG_TABLE_SNAPSHOT).copied().unwrap_or(0);
+    assert_eq!(n_checkpoints, 6, "{counts:?}");
+    // Snapshot fires when checkpoints_since_last_snapshot >= 2: between
+    // checkpoint 2 and checkpoint 3 (1st snapshot), then between checkpoint
+    // 4 and 5 (2nd snapshot), and between checkpoint 6 and... but trace
+    // ends. So 2 snapshots.
+    assert_eq!(n_snapshots, 2, "{counts:?}");
+
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    // Reader applied snapshots without the table contents drifting.
+    assert_eq!(r.strings().len(), 1);
+    assert_eq!(r.events().len(), 6);
+}
+
+#[test]
+fn snapshot_offsets_in_checkpoint_index_match_emitted_snapshots() {
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 1,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: 2,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..5u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    let cps = r.checkpoints();
+    // At least the first checkpoint should have snapshot_offset == 0
+    // (sentinel for "use initial tables" — no snapshot yet).
+    assert_eq!(cps[0].snapshot_offset, 0);
+    // Some later checkpoint should have a non-zero snapshot_offset, and
+    // when non-zero the byte at that offset should be a block-length u32
+    // followed by the snapshot tag.
+    let cp_with_snapshot = cps
+        .iter()
+        .find(|cp| cp.snapshot_offset != 0)
+        .expect("at least one checkpoint with explicit snapshot");
+    let off = cp_with_snapshot.snapshot_offset as usize;
+    assert_eq!(bytes[off + 4], BLOCK_TAG_TABLE_SNAPSHOT);
+}
+
+// ---------- seeking ----------
+
+#[test]
+fn seek_to_event_id_uses_index_anchor_when_available() {
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 2,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: u32::MAX,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..10u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    assert!(!r.checkpoints().is_empty());
+
+    // Seek to event 5 — should use the checkpoint at event_id <= 5 as
+    // anchor.
+    let cursor = r.seek_to_event_id(5).unwrap();
+    assert_eq!(cursor.first_event_id(), Some(5));
+    let anchor = cursor.seek_anchor().expect("seek used a checkpoint");
+    assert!(anchor.event_id <= 5);
+    // The cursor's slice begins at index 5.
+    assert_eq!(cursor.start_index(), 5);
+    assert_eq!(cursor.events().len(), 5);
+}
+
+#[test]
+fn seek_to_event_id_zero_anchor_is_none() {
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 2,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: u32::MAX,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..5u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+
+    // Seek to event 0 — no checkpoint is at event_id <= 0 except possibly
+    // none (since checkpoints fire after events have been recorded), so
+    // seek_anchor should be None.
+    let cursor = r.seek_to_event_id(0).unwrap();
+    assert_eq!(cursor.first_event_id(), Some(0));
+    assert_eq!(cursor.start_index(), 0);
+    // Either no checkpoints precede event 0 or the writer's earliest
+    // checkpoint is at event_id > 0; either way the seek uses no anchor.
+    assert!(cursor.seek_anchor().is_none());
+}
+
+#[test]
+fn seek_to_event_id_past_end_errors() {
+    let mut w = TraceWriter::new(fixture_metadata());
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..3u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    let result = r.seek_to_event_id(99);
+    assert!(matches!(result, Err(FormatError::SeekPastEnd { .. })));
+}
+
+#[test]
+fn seek_to_wall_clock_uses_index_anchor() {
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 2,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: u32::MAX,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..10u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 100,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    let recording_start = r.header().recording_start_ns;
+    // Event 5 has wall-clock = recording_start + 6 * 100 = +600ns. Seek
+    // there — wall clock target +500 should land at or just past event 5.
+    let target = recording_start + 500;
+    let cursor = r.seek_to_wall_clock(target).unwrap();
+    assert!(cursor.start_index() <= 5, "should not overshoot event 5");
+    let anchor = cursor.seek_anchor().expect("seek used a checkpoint");
+    assert!(anchor.wall_clock_ns <= target);
+}
+
+#[test]
+fn seek_anchor_proves_index_was_consulted() {
+    // A buggy seek that always returns from index 0 would still produce
+    // events()[0] = first event. But the cursor's seek_anchor would be
+    // None, exposing the bug. This test is the canary for that.
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 3,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: u32::MAX,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..9u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    // Seek to event 6 — there should be a checkpoint at event_id <= 6.
+    let cursor = r.seek_to_event_id(6).unwrap();
+    let anchor_idx = cursor.seek_anchor_index().expect("anchor index present");
+    assert!(anchor_idx > 0, "anchor checkpoint should not be the first");
+    let anchor = &r.checkpoints()[anchor_idx];
+    assert!(
+        anchor.event_id <= 6,
+        "anchor.event_id ({}) must be <= seek target (6)",
+        anchor.event_id
+    );
+}
+
+// ---------- total_blocks reflects all-block-types accounting ----------
+
+#[test]
+fn total_blocks_includes_checkpoints_updates_and_snapshots() {
+    let mut w = TraceWriter::with_config(
+        fixture_metadata(),
+        WriterConfig {
+            event_block_size_bytes: 1,
+            checkpoint_interval_events: 1,
+            checkpoint_interval_ns: u64::MAX,
+            snapshot_interval_checkpoints: 2,
+        },
+    );
+    let file_id = w.add_source_file("x.py", b"".to_vec());
+    let f = w.intern_string("f");
+    for i in 0..4u64 {
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns: 1,
+            frame_id: i,
+            function_id: f,
+            source_file_id: file_id,
+            line: 1,
+            args: vec![],
+        })
+        .unwrap();
+    }
+    let bytes = finalize(w);
+    let counts = count_blocks_by_tag(&bytes);
+    let observed_total: usize = counts.values().sum();
+    let r = TraceReader::from_bytes(&bytes).unwrap();
+    let summary = r.final_summary().unwrap();
+    // total_blocks = sum of all tagged blocks + 1 for the final summary.
+    let expected_total = observed_total + 1;
+    let needle = format!("total_blocks = {expected_total}");
+    assert!(
+        summary.payload.contains(&needle),
+        "expected `{needle}` in summary; got:\n{}",
+        summary.payload
+    );
 }
