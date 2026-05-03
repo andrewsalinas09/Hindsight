@@ -7,11 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "PyO3 bindings exposing the Hindsight Rust core to the Python recorder."
 
-# `name` is the cdylib filename (and Python's import name). Must equal the
-# `#[pymodule]` function name in `src/lib.rs` and `[tool.maturin].module-name`
-# in `pyproject.toml`.
+# `name` is the cdylib filename and the leaf segment of the Python import path.
+# We're a "mixed" maturin project: the user-facing package is `hindsight`
+# (pure Python under `python/hindsight/`) and the Rust extension is published
+# as the private submodule `hindsight._core`. The leaf is `_core`, so the
+# cdylib must be `_core.{so,pyd}`. Must match the `#[pymodule]` function name
+# in `src/lib.rs` and the `[tool.maturin].module-name` setting in
+# `pyproject.toml`.
 [lib]
-name = "hindsight_recorder"
+name = "_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

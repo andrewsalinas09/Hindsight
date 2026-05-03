@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Round-trip integration test for the hindsight_recorder Python module.
+"""Round-trip integration test for the hindsight Python module.
 
 Builds a small trace by hand via the TraceWriter API, finalizes it to disk,
 reads it back via read_trace, and asserts the contents match what was written.
@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-import hindsight_recorder
+import hindsight
 
 
 TRACE_UUID = bytes(range(16))
@@ -43,14 +43,14 @@ def make_metadata(start_ns: int = 1_700_000_000) -> dict:
 
 def test_module_loads():
     """Sanity check: the module name and the TraceWriter class are importable."""
-    assert hindsight_recorder.__name__ == "hindsight_recorder"
-    assert hasattr(hindsight_recorder, "TraceWriter")
-    assert hasattr(hindsight_recorder, "read_trace")
+    assert hindsight.__name__ == "hindsight"
+    assert hasattr(hindsight, "TraceWriter")
+    assert hasattr(hindsight, "read_trace")
 
 
 def test_finish_to_bytes_returns_valid_trace():
     """A trace finalized to bytes starts with the file magic and isn't empty."""
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     bytes_out = w.finish_to_bytes(1_700_001_000)
     assert isinstance(bytes_out, (bytes, bytearray))
     assert bytes_out[:8] == b"HNDSGHT\x00"
@@ -59,7 +59,7 @@ def test_finish_to_bytes_returns_valid_trace():
 
 def test_finished_writer_rejects_further_calls():
     """Once finished, methods raise RuntimeError rather than corrupt state."""
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     w.finish_to_bytes(1_700_001_000)
     with pytest.raises(RuntimeError):
         w.intern_string("foo")
@@ -69,7 +69,7 @@ def test_finished_writer_rejects_further_calls():
 
 def test_intern_value_dedups_primitives():
     """Same Python value -> same ID; bool != int(0/1)."""
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     assert w.intern_value(None) == 0  # NONE_VALUE_ID
     a = w.intern_value(42)
     b = w.intern_value(42)
@@ -85,11 +85,11 @@ def test_intern_value_dedups_primitives():
 def test_metadata_must_have_required_fields():
     """A malformed metadata dict raises a Python ValueError."""
     with pytest.raises(ValueError):
-        hindsight_recorder.TraceWriter({})  # type: ignore[arg-type]
+        hindsight.TraceWriter({})  # type: ignore[arg-type]
     md = make_metadata()
     del md["recorder"]
     with pytest.raises(ValueError):
-        hindsight_recorder.TraceWriter(md)  # type: ignore[arg-type]
+        hindsight.TraceWriter(md)  # type: ignore[arg-type]
 
 
 def test_round_trip_complete_trace(tmp_path: Path):
@@ -100,7 +100,7 @@ def test_round_trip_complete_trace(tmp_path: Path):
     """
     trace_path = tmp_path / "trace.hindsight"
 
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
 
     # 1. Source file ------------------------------------------------
     src = "def double(x):\n    result = x * 2\n    return result\n"
@@ -167,7 +167,7 @@ def test_round_trip_complete_trace(tmp_path: Path):
     assert trace_path.stat().st_size > 64
 
     # 6. Read back and verify --------------------------------------
-    trace = hindsight_recorder.read_trace(str(trace_path))
+    trace = hindsight.read_trace(str(trace_path))
 
     assert trace["is_finalized"] is True
     assert trace["header"]["trace_uuid"] == TRACE_UUID
@@ -246,10 +246,10 @@ def test_round_trip_complete_trace(tmp_path: Path):
 def test_empty_trace_is_well_formed(tmp_path: Path):
     """A writer with no events / no sources still produces a valid file."""
     trace_path = tmp_path / "empty.hindsight"
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     w.finish(str(trace_path), recording_end_ns=1_700_000_500)
 
-    trace = hindsight_recorder.read_trace(str(trace_path))
+    trace = hindsight.read_trace(str(trace_path))
     assert trace["is_finalized"] is True
     assert trace["events"] == []
     assert trace["source_files"] == []
@@ -259,7 +259,7 @@ def test_empty_trace_is_well_formed(tmp_path: Path):
 
 def test_intern_value_summary_with_explicit_args():
     """The explicit summary path lets the caller bypass the auto-summary fallback."""
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     type_name_id = w.intern_string("numpy.ndarray")
     repr_id = w.intern_string("array([1, 2, 3])")
     sid = w.intern_value_summary(type_name_id, length=3, repr=repr_id)
@@ -270,7 +270,7 @@ def test_intern_value_summary_with_explicit_args():
 
 def test_intern_value_with_identity_requires_16_bytes():
     """Identity hash must be exactly 16 bytes; anything else raises ValueError."""
-    w = hindsight_recorder.TraceWriter(make_metadata())
+    w = hindsight.TraceWriter(make_metadata())
     with pytest.raises(ValueError):
         w.intern_value_with_identity(42, b"\x00" * 8)
     with pytest.raises(ValueError):

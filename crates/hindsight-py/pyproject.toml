@@ -1,9 +1,9 @@
-# PyPI distribution name. The lookup-on-PyPI name `hindsight` is taken; we
-# use `hindsight-recorder` as a placeholder until naming is resolved.
+# Distribution name. Was `hindsight-recorder` in session A as a placeholder;
+# we're claiming `hindsight` now (the original 2013 PyPI package was abandoned).
 [project]
-name = "hindsight-recorder"
+name = "hindsight"
 version = "0.1.0"
-description = "Python bindings for the Hindsight trace recorder."
+description = "AI-native debugger built around the Model Context Protocol."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 
@@ -12,9 +12,13 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-# Importable Python module name. Must match `[lib].name` in Cargo.toml and the
-# `#[pymodule]` function name in `src/lib.rs`.
-module-name = "hindsight_recorder"
+# Mixed Python/Rust layout. Pure-Python sources live under `python/`; the
+# `hindsight` package's user-facing API (the `@record` decorator etc.) is in
+# `python/hindsight/__init__.py`. The Rust extension is published as a
+# private submodule `hindsight._core` — its leaf must match `[lib].name` in
+# `Cargo.toml` and the `#[pymodule]` function name in `src/lib.rs`.
+python-source = "python"
+module-name = "hindsight._core"
 # Enable PyO3's `extension-module` feature for wheel builds so it doesn't try
 # to link libpython (the host interpreter provides it). `cargo test` builds
 # don't see this feature, so unit tests can still embed Python via PyO3's

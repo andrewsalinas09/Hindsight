@@ -3,8 +3,9 @@
 //! PyO3 bindings exposing the Hindsight Rust core to the Python recorder.
 //!
 //! This module makes the `hindsight-format` writer (and a small mirror of the
-//! reader, just enough to back integration tests) available to Python under
-//! the importable name `hindsight_recorder`.
+//! reader, just enough to back integration tests) available to Python as the
+//! private submodule `hindsight._core`. The user-facing `hindsight` package
+//! lives in `python/hindsight/` and re-exports a curated surface from here.
 //!
 //! Session A scope (no `sys.monitoring` integration yet):
 //! - `TraceWriter` pyclass exposing source/string/value interning, the four
@@ -299,7 +300,7 @@ fn convert_summary(
 /// the underlying writer (the Rust `finish` consumes `self`). Every other
 /// method goes through `inner_mut()` which raises a Python `RuntimeError` if
 /// the writer was already finished.
-#[pyclass(name = "TraceWriter", module = "hindsight_recorder")]
+#[pyclass(name = "TraceWriter", module = "hindsight._core")]
 struct PyTraceWriter {
     inner: Option<hindsight_format::TraceWriter>,
 }
@@ -861,8 +862,10 @@ fn event_tag_byte(tag: EventTag) -> u8 {
 
 // --- Module registration ----------------------------------------------------
 
+/// Function name must match `[lib].name` in `Cargo.toml` and the leaf of
+/// `[tool.maturin].module-name` in `pyproject.toml` — `_core` for all three.
 #[pymodule]
-fn hindsight_recorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTraceWriter>()?;
     m.add_function(wrap_pyfunction!(read_trace, m)?)?;
     Ok(())
