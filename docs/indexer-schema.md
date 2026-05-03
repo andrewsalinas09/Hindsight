@@ -201,6 +201,7 @@ CREATE TABLE values (
     -- summary fields (for type='summary' or any inlined-with-summary container)
     type_name             VARCHAR,                 -- e.g., 'numpy.ndarray', 'list', 'MyClass'
     repr_text             VARCHAR,                 -- truncated repr() output for summaries
+    summary_length        BIGINT,                  -- type='summary'; type-defined length measure (bytes for strings/bytes; element count for collection summaries; recorder-defined for arbitrary objects)
 
     -- type ref (for type='type_ref')
     type_ref_name         VARCHAR
@@ -220,6 +221,7 @@ CREATE INDEX values_string_value ON values(string_value);
 - For mutable objects (lists, dicts, sets that change over time), the `hash_kind` distinguishes content (snapshot of contents) from identity (Python object identity). The same mutable object across mutations has the same identity_hash but different content_hashes.
 - Container values reference their elements via `value_elements`, not via inline columns.
 - The `repr_text` field is populated for summaries and provides the truncated string representation users see when querying large values.
+- `container_length` and `summary_length` are intentionally separate columns even though both store an integer count. They mean different things — `container_length` is element count for inline lists/dicts/sets, while `summary_length` is the recorder's type-defined length measure (byte count for summarized strings, dimensional info for arrays, an arbitrary recorder-chosen number for opaque objects). Squatting one column for both would conflate "lists with > 100 items" and "byte buffers > 100 bytes" under the same query, which is a footgun.
 
 ### `value_elements`
 
@@ -365,6 +367,7 @@ CREATE INDEX scope_boundaries_type ON scope_boundaries(boundary_type);
 
 - Six boundary types, paired (entered_X / exited_X).
 - `reason` is informational: for excluded functions, the matched pattern; for depth-clipped, the depth limit; for skip blocks, typically just 'user-initiated'.
+- `frame_id` is the recorded frame in which the boundary was *observed*. For `entered_excluded` / `entered_depth_clipped` boundaries this is the calling (recorded) frame, not the excluded callee — the callee never gets a frame row because it isn't recorded. For `entered_skip` / `exited_skip` it is the frame containing the `with hindsight.skip():` block. The same convention is used for `events.frame_id` on scope_boundary rows.
 
 ## Trace metadata
 

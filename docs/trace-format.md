@@ -718,6 +718,8 @@ Tags `0x80`-`0xFF` are available for language-specific encodings. Each language 
 
 **TODO(v0.3):** the rows for `0x03` (int big), `0x05` (string), and `0x06` (bytes) describe the encoding as "length-prefixed", which is ambiguous about whether they carry a *second*, inner length prefix on top of the value-table-entry length. The current writer/reader pair treats them as **the value-table-entry length only** — no inner length, the encoded data fills the entry. Reword these rows to say "raw bytes (entry length bounds the run)" or similar. Surfaced by the reader implementation.
 
+**TODO(v0.3):** distinguish list / tuple / set / frozenset at the type-tag level. v0.2 collapses list+tuple onto `0x07` and set+frozenset onto `0x09`, expecting consumers to read a separate `TypeRef` to disambiguate — but inline containers don't carry one, so the indexer can't tell them apart and `frames.argument_summary` and `values.type_name` both lose the distinction. Plan: introduce dedicated tags from the reserved primitive range (e.g. `0x13` tuple, `0x14` frozenset) so each Python collection type round-trips losslessly. This is a deliberate spec revision, not an indexer-side workaround; defer until `hindsight-format` work resumes. Surfaced by the indexer implementation.
+
 ### Inlining vs. summarization
 
 Values below a size threshold are encoded fully (inlined). Values above the threshold are summarized — only their type, identity hash, length, and a truncated representation are stored.
