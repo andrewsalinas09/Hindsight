@@ -1,0 +1,22 @@
+# PyPI distribution name. The lookup-on-PyPI name `hindsight` is taken; we
+# use `hindsight-recorder` as a placeholder until naming is resolved.
+[project]
+name = "hindsight-recorder"
+version = "0.1.0"
+description = "Python bindings for the Hindsight trace recorder."
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Importable Python module name. Must match `[lib].name` in Cargo.toml and the
+# `#[pymodule]` function name in `src/lib.rs`.
+module-name = "hindsight_recorder"
+# Enable PyO3's `extension-module` feature for wheel builds so it doesn't try
+# to link libpython (the host interpreter provides it). `cargo test` builds
+# don't see this feature, so unit tests can still embed Python via PyO3's
+# `auto-initialize` dev-dependency feature.
+features = ["pyo3/extension-module"]

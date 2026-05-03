@@ -1,17 +1,1090 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! PyO3 bindings exposing the Hindsight Rust core to the Python recorder.
+//!
+//! This module makes the `hindsight-format` writer (and a small mirror of the
+//! reader, just enough to back integration tests) available to Python under
+//! the importable name `hindsight_recorder`.
+//!
+//! Session A scope (no `sys.monitoring` integration yet):
+//! - `TraceWriter` pyclass exposing source/string/value interning, the four
+//!   v0 event types the recorder will emit first (FUNCTION_ENTRY,
+//!   FUNCTION_EXIT, FRAME_SNAPSHOT, LINE_DELTA), and finalization to file or
+//!   bytes.
+//! - `read_trace(path)` function returning a `dict` of the trace's contents,
+//!   used by the Python integration test to verify round-trip.
+//!
+//! `convert_value` is the heart of the boundary: it walks any Python value,
+//! converts each node, and auto-interns children before parents so the
+//! writer's "child IDs must already exist" contract holds.
 
-pub fn hello_world() -> &'static str {
-    "hello from hindsight-py"
+use std::path::PathBuf;
+
+use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::{
+    PyAny, PyBool, PyBytes, PyDict, PyFloat, PyFrozenSet, PyInt, PyList, PySet, PyString, PyTuple,
+};
+
+use hindsight_format::{
+    Argument, Change, Event, EventTag, Finalization, FrameSnapshot, FunctionEntry, FunctionExit,
+    HashKind, LineDelta, Local, Metadata, NONE_VALUE_ID, ProgramInfo, RecorderInfo, RecordingInfo,
+    ScopeConfig, ScopeResolution, SourceFile, TraceReader, Value, ValueEntry, ValueId, ValueTag,
+};
+
+/// Maximum char count we keep from `repr(obj)` when summarizing arbitrary
+/// objects. Char-based, not byte-based, so we never split a UTF-8 codepoint.
+const SUMMARY_REPR_MAX_CHARS: usize = 256;
+
+// --- Metadata dict parsing --------------------------------------------------
+
+/// Convert a Python `dict` into a Rust `Metadata`. Expected shape:
+///
+/// ```python
+/// {
+///     "recorder": {"language": str, "language_version": str,
+///                  "recorder_version": str, "platform": str},
+///     "recording": {"program": str,
+///                   "working_directory": str | None,
+///                   "scope_config": {"include": [str], "exclude": [str],
+///                                    "depth_limit": int | None}},
+///     "program": {"<key>": "<value>", ...} | None,
+///     "trace_uuid": bytes (length 16),
+///     "recording_start_ns": int,
+/// }
+/// ```
+fn metadata_from_dict(dict: &Bound<'_, PyDict>) -> PyResult<Metadata> {
+    let recorder = get_required_dict(dict, "recorder")?;
+    let recording = get_required_dict(dict, "recording")?;
+    let scope_config = get_required_dict(&recording, "scope_config")?;
+
+    let trace_uuid_bytes: Vec<u8> = get_item(dict, "trace_uuid")?
+        .ok_or_else(|| PyValueError::new_err("metadata: missing 'trace_uuid'"))?
+        .extract()?;
+    if trace_uuid_bytes.len() != 16 {
+        return Err(PyValueError::new_err(format!(
+            "metadata: 'trace_uuid' must be 16 bytes, got {}",
+            trace_uuid_bytes.len()
+        )));
+    }
+    let mut trace_uuid = [0u8; 16];
+    trace_uuid.copy_from_slice(&trace_uuid_bytes);
+
+    let recording_start_ns: u64 = get_item(dict, "recording_start_ns")?
+        .ok_or_else(|| PyValueError::new_err("metadata: missing 'recording_start_ns'"))?
+        .extract()?;
+
+    let recorder = RecorderInfo {
+        language: extract_string(&recorder, "language")?,
+        language_version: extract_string(&recorder, "language_version")?,
+        recorder_version: extract_string(&recorder, "recorder_version")?,
+        platform: extract_string(&recorder, "platform")?,
+    };
+
+    let recording = RecordingInfo {
+        program: extract_string(&recording, "program")?,
+        working_directory: extract_optional_string(&recording, "working_directory")?,
+        scope_config: ScopeConfig {
+            include: extract_optional_string_list(&scope_config, "include")?.unwrap_or_default(),
+            exclude: extract_optional_string_list(&scope_config, "exclude")?.unwrap_or_default(),
+            depth_limit: get_item(&scope_config, "depth_limit")?
+                .filter(|v| !v.is_none())
+                .map(|v| v.extract::<u32>())
+                .transpose()?,
+        },
+    };
+
+    let program = match get_item(dict, "program")? {
+        Some(v) if !v.is_none() => {
+            let d: Bound<'_, PyDict> = v
+                .downcast_into()
+                .map_err(|_| PyValueError::new_err("metadata: 'program' must be a dict or None"))?;
+            let mut fields = Vec::with_capacity(d.len());
+            for (k, val) in d.iter() {
+                fields.push((k.extract::<String>()?, val.extract::<String>()?));
+            }
+            Some(ProgramInfo { fields })
+        }
+        _ => None,
+    };
+
+    Ok(Metadata {
+        recorder,
+        recording,
+        program,
+        trace_uuid,
+        recording_start_ns,
+    })
 }
+
+fn get_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+    d.get_item(key)
+}
+
+fn get_required_dict<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyDict>> {
+    let v = get_item(d, key)?
+        .ok_or_else(|| PyValueError::new_err(format!("metadata: missing '{key}'")))?;
+    v.downcast_into::<PyDict>()
+        .map_err(|_| PyValueError::new_err(format!("metadata: '{key}' must be a dict")))
+}
+
+fn extract_string(d: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
+    get_item(d, key)?
+        .ok_or_else(|| PyValueError::new_err(format!("metadata: missing '{key}'")))?
+        .extract::<String>()
+}
+
+fn extract_optional_string(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    match get_item(d, key)? {
+        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
+        _ => Ok(None),
+    }
+}
+
+fn extract_optional_string_list(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<Vec<String>>> {
+    match get_item(d, key)? {
+        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
+        _ => Ok(None),
+    }
+}
+
+// --- Value conversion -------------------------------------------------------
+
+/// Walk a Python value, recursively interning children before parents, and
+/// return the parent's `ValueId`.
+///
+/// **Type-dispatch order matters** for two reasons:
+/// - `bool` is a subclass of `int` in Python, so the bool check has to win
+///   over the int check.
+/// - The summary fallback must come last so it doesn't swallow real types we
+///   know how to encode inline.
+fn convert_value(
+    writer: &mut hindsight_format::TraceWriter,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<ValueId> {
+    if obj.is_none() {
+        return Ok(NONE_VALUE_ID);
+    }
+
+    if obj.is_instance_of::<PyBool>() {
+        let b: bool = obj.extract()?;
+        return Ok(writer.intern_value_inline(Value::Bool(b)));
+    }
+
+    if obj.is_instance_of::<PyInt>() {
+        return convert_int(writer, obj);
+    }
+
+    if obj.is_instance_of::<PyFloat>() {
+        let f: f64 = obj.extract()?;
+        return Ok(writer.intern_value_inline(Value::Float(f)));
+    }
+
+    if obj.is_instance_of::<PyString>() {
+        let s: String = obj.extract()?;
+        return Ok(writer.intern_value_inline(Value::String(s)));
+    }
+
+    if obj.is_instance_of::<PyBytes>() {
+        let b: Vec<u8> = obj.extract()?;
+        return Ok(writer.intern_value_inline(Value::Bytes(b)));
+    }
+
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut child_ids = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            child_ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(writer.intern_value_inline(Value::List(child_ids)));
+    }
+
+    if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        let mut child_ids = Vec::with_capacity(tuple.len());
+        for item in tuple.iter() {
+            child_ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(writer.intern_value_inline(Value::List(child_ids)));
+    }
+
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut pairs = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let kid = convert_value(writer, &k)?;
+            let vid = convert_value(writer, &v)?;
+            pairs.push((kid, vid));
+        }
+        return Ok(writer.intern_value_inline(Value::Dict(pairs)));
+    }
+
+    if let Ok(set) = obj.downcast::<PySet>() {
+        let mut ids = Vec::with_capacity(set.len());
+        for item in set.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(writer.intern_value_inline(Value::Set(ids)));
+    }
+
+    if let Ok(frozen) = obj.downcast::<PyFrozenSet>() {
+        let mut ids = Vec::with_capacity(frozen.len());
+        for item in frozen.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(writer.intern_value_inline(Value::Set(ids)));
+    }
+
+    convert_summary(writer, obj)
+}
+
+/// Try `extract::<i64>()` first; fall back to canonical-bytes BigInt when the
+/// Python int is outside i64. We intentionally trust Python's `int.to_bytes`
+/// to produce the canonical (two's-complement, big-endian, minimum-length)
+/// bytes the writer requires — see `Value::BigInt`'s caller-contract docs.
+fn convert_int(
+    writer: &mut hindsight_format::TraceWriter,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<ValueId> {
+    match obj.extract::<i64>() {
+        Ok(i) => Ok(writer.intern_value_inline(Value::Int(i))),
+        Err(_) => {
+            let bytes = python_int_to_canonical_bytes(obj)?;
+            Ok(writer.intern_value_inline(Value::BigInt(bytes)))
+        }
+    }
+}
+
+/// Compute minimum-byte-length two's-complement big-endian bytes for an
+/// arbitrary-precision Python int by calling `int.bit_length()` and
+/// `int.to_bytes(length, "big", signed=True)`.
+///
+/// `length = (bit_length + 8) // 8` — the +8 reserves one bit for sign on
+/// positive values and one byte for sign-extension on negatives, while
+/// staying minimal.
+fn python_int_to_canonical_bytes(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    let py = obj.py();
+    let bit_length: u32 = obj.call_method0("bit_length")?.extract()?;
+    let length: u64 = (u64::from(bit_length) + 8) / 8;
+
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("signed", true)?;
+    let bytes_obj = obj
+        .call_method("to_bytes", (length, "big"), Some(&kwargs))
+        .map_err(|e| PyOverflowError::new_err(format!("int.to_bytes failed: {e}")))?;
+    bytes_obj.extract::<Vec<u8>>()
+}
+
+/// Summary fallback for any Python type we don't know how to inline.
+/// type_name = `type(obj).__qualname__`. length is set to 0 (placeholder —
+/// see spec note: the length field is type-defined and not meaningful for
+/// arbitrary objects). repr is `repr(obj)` truncated at 256 chars.
+fn convert_summary(
+    writer: &mut hindsight_format::TraceWriter,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<ValueId> {
+    let type_name: String = obj.get_type().qualname()?.extract()?;
+    let repr_full: String = obj.repr()?.extract()?;
+    let repr_truncated: String = repr_full.chars().take(SUMMARY_REPR_MAX_CHARS).collect();
+
+    let type_name_id = writer.intern_string(type_name);
+    let repr_id = writer.intern_string(repr_truncated);
+    writer
+        .intern_value_summary(type_name_id, 0, repr_id)
+        .map_err(format_err)
+}
+
+// --- TraceWriter pyclass ----------------------------------------------------
+
+/// Python-facing trace writer. Wraps `hindsight_format::TraceWriter`.
+///
+/// `inner` is `Option` so `finish` / `finish_to_bytes` can take ownership of
+/// the underlying writer (the Rust `finish` consumes `self`). Every other
+/// method goes through `inner_mut()` which raises a Python `RuntimeError` if
+/// the writer was already finished.
+#[pyclass(name = "TraceWriter", module = "hindsight_recorder")]
+struct PyTraceWriter {
+    inner: Option<hindsight_format::TraceWriter>,
+}
+
+#[pymethods]
+impl PyTraceWriter {
+    /// Construct a new writer. `metadata` is a dict; see `metadata_from_dict`
+    /// for the expected shape.
+    #[new]
+    fn new(metadata: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let metadata = metadata_from_dict(metadata)?;
+        Ok(Self {
+            inner: Some(hindsight_format::TraceWriter::new(metadata)),
+        })
+    }
+
+    /// Add a source file. Returns the assigned file ID. Duplicate paths
+    /// return the existing ID without overwriting content.
+    fn add_source_file(&mut self, path: &str, content: &str) -> PyResult<u64> {
+        let w = self.inner_mut()?;
+        Ok(w.add_source_file(path.to_string(), content.as_bytes().to_vec()))
+    }
+
+    /// Intern a string. Returns its string ID; same content returns same ID.
+    fn intern_string(&mut self, s: &str) -> PyResult<u64> {
+        let w = self.inner_mut()?;
+        Ok(w.intern_string(s.to_string()))
+    }
+
+    /// Intern a Python value, recursively interning children. Returns the
+    /// value ID. See `convert_value` for type dispatch and the summary
+    /// fallback for unknown types.
+    fn intern_value(&mut self, value: &Bound<'_, PyAny>) -> PyResult<u64> {
+        let w = self.inner_mut()?;
+        convert_value(w, value)
+    }
+
+    /// Intern a summary value directly: pre-interned `type_name` string ID,
+    /// a length (type-defined), and a pre-interned `repr` string ID.
+    fn intern_value_summary(&mut self, type_name: u64, length: u64, repr: u64) -> PyResult<u64> {
+        let w = self.inner_mut()?;
+        w.intern_value_summary(type_name, length, repr)
+            .map_err(format_err)
+    }
+
+    /// Intern a value with a caller-provided 16-byte identity hash. The
+    /// Python value's structure is converted as for `intern_value` (children
+    /// content-hashed); the parent itself goes in with hash kind = Identity.
+    fn intern_value_with_identity(
+        &mut self,
+        value: &Bound<'_, PyAny>,
+        identity_hash: &[u8],
+    ) -> PyResult<u64> {
+        if identity_hash.len() != 16 {
+            return Err(PyValueError::new_err(format!(
+                "identity_hash must be exactly 16 bytes, got {}",
+                identity_hash.len()
+            )));
+        }
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(identity_hash);
+
+        let w = self.inner_mut()?;
+        let value = python_value_to_rust(w, value)?;
+        Ok(w.intern_value_with_identity(value, hash))
+    }
+
+    /// Write a FUNCTION_ENTRY event. `args` is an iterable of
+    /// `(string_id, value_id)` tuples, one per argument.
+    fn write_function_entry(
+        &mut self,
+        timestamp_delta_ns: u64,
+        frame_id: u64,
+        function_id: u64,
+        source_file_id: u64,
+        line: u32,
+        args: Vec<(u64, u64)>,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_function_entry(FunctionEntry {
+            timestamp_delta_ns,
+            frame_id,
+            function_id,
+            source_file_id,
+            line,
+            args: args
+                .into_iter()
+                .map(|(name, value)| Argument { name, value })
+                .collect(),
+        })
+        .map_err(format_err)
+    }
+
+    /// Write a FUNCTION_EXIT event.
+    fn write_function_exit(
+        &mut self,
+        timestamp_delta_ns: u64,
+        frame_id: u64,
+        return_value: u64,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_function_exit(FunctionExit {
+            timestamp_delta_ns,
+            frame_id,
+            return_value,
+        })
+        .map_err(format_err)
+    }
+
+    /// Write a FRAME_SNAPSHOT event. `locals` is `(string_id, value_id)` pairs.
+    fn write_frame_snapshot(
+        &mut self,
+        timestamp_delta_ns: u64,
+        frame_id: u64,
+        line: u32,
+        locals: Vec<(u64, u64)>,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_frame_snapshot(FrameSnapshot {
+            timestamp_delta_ns,
+            frame_id,
+            line,
+            locals: locals
+                .into_iter()
+                .map(|(name, value)| Local { name, value })
+                .collect(),
+        })
+        .map_err(format_err)
+    }
+
+    /// Write a LINE_DELTA event. `changes` is `(string_id, value_id)` pairs.
+    fn write_line_delta(
+        &mut self,
+        timestamp_delta_ns: u64,
+        line: u32,
+        changes: Vec<(u64, u64)>,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_line_delta(LineDelta {
+            timestamp_delta_ns,
+            line,
+            changes: changes
+                .into_iter()
+                .map(|(name, value)| Change { name, value })
+                .collect(),
+        })
+        .map_err(format_err)
+    }
+
+    /// Finalize the trace and write it to a file at `path`. After this call
+    /// the writer is consumed; further methods raise `RuntimeError`.
+    fn finish(&mut self, path: PathBuf, recording_end_ns: u64) -> PyResult<()> {
+        let writer = self.take_writer()?;
+        let bytes = writer
+            .finish_to_bytes(default_finalization(recording_end_ns))
+            .map_err(format_err)?;
+        std::fs::write(path, bytes).map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Finalize the trace and return its bytes. Convenience for in-memory
+    /// callers (tests).
+    fn finish_to_bytes<'py>(
+        &mut self,
+        py: Python<'py>,
+        recording_end_ns: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let writer = self.take_writer()?;
+        let bytes = writer
+            .finish_to_bytes(default_finalization(recording_end_ns))
+            .map_err(format_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+impl PyTraceWriter {
+    fn inner_mut(&mut self) -> PyResult<&mut hindsight_format::TraceWriter> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("TraceWriter has already been finished"))
+    }
+
+    fn take_writer(&mut self) -> PyResult<hindsight_format::TraceWriter> {
+        self.inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("TraceWriter has already been finished"))
+    }
+}
+
+fn default_finalization(recording_end_ns: u64) -> Finalization {
+    // Session A doesn't have scope-resolution data (the recorder hasn't been
+    // built yet). An empty `ScopeResolution` still produces a valid final
+    // summary block.
+    Finalization {
+        recording_end_ns,
+        scope_resolution: ScopeResolution::default(),
+    }
+}
+
+/// Convert a Python value to a Rust `Value` *and* intern any container
+/// children, returning the parent value uninterned. Used by
+/// `intern_value_with_identity`, where the caller wants Identity hashing on
+/// the parent but content hashing on the children.
+fn python_value_to_rust(
+    writer: &mut hindsight_format::TraceWriter,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::None);
+    }
+    if obj.is_instance_of::<PyBool>() {
+        return Ok(Value::Bool(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyInt>() {
+        return match obj.extract::<i64>() {
+            Ok(i) => Ok(Value::Int(i)),
+            Err(_) => Ok(Value::BigInt(python_int_to_canonical_bytes(obj)?)),
+        };
+    }
+    if obj.is_instance_of::<PyFloat>() {
+        return Ok(Value::Float(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyString>() {
+        return Ok(Value::String(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyBytes>() {
+        return Ok(Value::Bytes(obj.extract()?));
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut ids = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(Value::List(ids));
+    }
+    if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        let mut ids = Vec::with_capacity(tuple.len());
+        for item in tuple.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(Value::List(ids));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut pairs = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            pairs.push((convert_value(writer, &k)?, convert_value(writer, &v)?));
+        }
+        return Ok(Value::Dict(pairs));
+    }
+    if let Ok(set) = obj.downcast::<PySet>() {
+        let mut ids = Vec::with_capacity(set.len());
+        for item in set.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(Value::Set(ids));
+    }
+    if let Ok(frozen) = obj.downcast::<PyFrozenSet>() {
+        let mut ids = Vec::with_capacity(frozen.len());
+        for item in frozen.iter() {
+            ids.push(convert_value(writer, &item)?);
+        }
+        return Ok(Value::Set(ids));
+    }
+    Err(PyValueError::new_err(
+        "intern_value_with_identity: value type cannot be Identity-hashed (only inlinable types are supported)",
+    ))
+}
+
+fn format_err<E: std::fmt::Display>(e: E) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
+}
+
+// --- Reader -----------------------------------------------------------------
+
+/// Read a `.hindsight` trace from disk and return its contents as a Python
+/// dict suitable for inspection in tests. See `trace_to_dict` for the shape.
+#[pyfunction]
+fn read_trace(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyDict>> {
+    let bytes = std::fs::read(path).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let reader = TraceReader::from_bytes(&bytes).map_err(format_err)?;
+    Ok(trace_to_dict(py, &reader)?.unbind())
+}
+
+/// Build the dict shape returned by `read_trace`. Values are decoded eagerly,
+/// recursively building Python equivalents — so a list value comes back as a
+/// real Python list of resolved children, not a list of value IDs.
+fn trace_to_dict<'py>(py: Python<'py>, reader: &TraceReader) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+
+    out.set_item("is_finalized", reader.is_finalized())?;
+
+    let header = reader.header();
+    let header_dict = PyDict::new(py);
+    header_dict.set_item("trace_uuid", PyBytes::new(py, &header.trace_uuid))?;
+    header_dict.set_item("recording_start_ns", header.recording_start_ns)?;
+    header_dict.set_item("recording_end_ns", header.recording_end_ns)?;
+    out.set_item("header", header_dict)?;
+
+    out.set_item("metadata_toml", &reader.metadata().payload)?;
+
+    let source_files = PyList::empty(py);
+    for sf in reader.source_files() {
+        source_files.append(source_file_to_dict(py, sf)?)?;
+    }
+    out.set_item("source_files", source_files)?;
+
+    let strings = PyList::empty(py);
+    for s in reader.strings() {
+        strings.append(s)?;
+    }
+    out.set_item("strings", strings)?;
+
+    let decoded_cache: Vec<Py<PyAny>> = decode_all_values(py, reader)?;
+
+    let values = PyList::empty(py);
+    for (i, ve) in reader.values().iter().enumerate() {
+        values.append(value_entry_to_dict(py, ve, &decoded_cache, i)?)?;
+    }
+    out.set_item("values", values)?;
+
+    let events = PyList::empty(py);
+    for e in reader.events() {
+        events.append(event_to_dict(py, e)?)?;
+    }
+    out.set_item("events", events)?;
+
+    if let Some(s) = reader.final_summary() {
+        out.set_item("final_summary_toml", &s.payload)?;
+    } else {
+        out.set_item("final_summary_toml", py.None())?;
+    }
+
+    Ok(out)
+}
+
+fn source_file_to_dict<'py>(py: Python<'py>, sf: &SourceFile) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("file_id", sf.file_id)?;
+    d.set_item("path", &sf.path)?;
+    d.set_item("content", PyBytes::new(py, &sf.content))?;
+    d.set_item("blake3_hash", PyBytes::new(py, &sf.blake3_hash))?;
+    Ok(d)
+}
+
+/// Decode every value in the value table to its Python equivalent, in
+/// table order. Containers reference earlier IDs (the writer enforces no
+/// forward refs), so a single forward pass is enough.
+fn decode_all_values(py: Python<'_>, reader: &TraceReader) -> PyResult<Vec<Py<PyAny>>> {
+    let entries = reader.values();
+    let mut decoded: Vec<Py<PyAny>> = Vec::with_capacity(entries.len());
+    for (i, ve) in entries.iter().enumerate() {
+        let v = decode_value_entry(py, ve, &decoded, i, reader)?;
+        decoded.push(v);
+    }
+    Ok(decoded)
+}
+
+fn decode_value_entry(
+    py: Python<'_>,
+    ve: &ValueEntry,
+    decoded_so_far: &[Py<PyAny>],
+    current_index: usize,
+    reader: &TraceReader,
+) -> PyResult<Py<PyAny>> {
+    let resolve = |id: ValueId| -> PyResult<Py<PyAny>> {
+        let id = id as usize;
+        if id >= current_index {
+            return Err(PyRuntimeError::new_err(format!(
+                "value table forward ref: value[{current_index}] points to value[{id}]"
+            )));
+        }
+        Ok(decoded_so_far[id].clone_ref(py))
+    };
+
+    let obj: Py<PyAny> = match &ve.value {
+        Value::None => py.None(),
+        Value::ExceptionUnwindSentinel => {
+            // Distinguish from None for tests that care to check.
+            let d = PyDict::new(py);
+            d.set_item("kind", "exception_unwind_sentinel")?;
+            d.into_any().unbind()
+        }
+        Value::Bool(b) => PyBool::new(py, *b).to_owned().into_any().unbind(),
+        Value::Int(i) => i.into_pyobject(py)?.into_any().unbind(),
+        Value::BigInt(bytes) => {
+            let int_type = py.import("builtins")?.getattr("int")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("signed", true)?;
+            int_type
+                .call_method(
+                    "from_bytes",
+                    (PyBytes::new(py, bytes), "big"),
+                    Some(&kwargs),
+                )?
+                .unbind()
+        }
+        Value::Float(f) => f.into_pyobject(py)?.into_any().unbind(),
+        Value::String(s) => s.into_pyobject(py)?.into_any().unbind(),
+        Value::Bytes(b) => PyBytes::new(py, b).into_any().unbind(),
+        Value::List(ids) => {
+            let list = PyList::empty(py);
+            for id in ids {
+                list.append(resolve(*id)?)?;
+            }
+            list.into_any().unbind()
+        }
+        Value::Dict(pairs) => {
+            let dict = PyDict::new(py);
+            for (k, v) in pairs {
+                dict.set_item(resolve(*k)?, resolve(*v)?)?;
+            }
+            dict.into_any().unbind()
+        }
+        Value::Set(ids) => {
+            let set = PySet::empty(py)?;
+            for id in ids {
+                set.add(resolve(*id)?)?;
+            }
+            set.into_any().unbind()
+        }
+        Value::CycleRef(depth) => {
+            let d = PyDict::new(py);
+            d.set_item("kind", "cycle_ref")?;
+            d.set_item("depth", *depth)?;
+            d.into_any().unbind()
+        }
+        Value::Summary {
+            type_name,
+            length,
+            repr,
+        } => {
+            let d = PyDict::new(py);
+            d.set_item("kind", "summary")?;
+            d.set_item("type_name", &reader.strings()[*type_name as usize])?;
+            d.set_item("length", *length)?;
+            d.set_item("repr", &reader.strings()[*repr as usize])?;
+            d.into_any().unbind()
+        }
+        Value::TypeRef(string_id) => {
+            let d = PyDict::new(py);
+            d.set_item("kind", "type_ref")?;
+            d.set_item("type_name", &reader.strings()[*string_id as usize])?;
+            d.into_any().unbind()
+        }
+    };
+    Ok(obj)
+}
+
+fn value_entry_to_dict<'py>(
+    py: Python<'py>,
+    ve: &ValueEntry,
+    decoded_cache: &[Py<PyAny>],
+    index: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("value_id", index as u64)?;
+    d.set_item("tag", value_tag_byte(ve.value.tag()))?;
+    d.set_item("hash_kind", hash_kind_byte(ve.hash_kind))?;
+    d.set_item("hash", PyBytes::new(py, &ve.hash))?;
+    d.set_item("decoded", decoded_cache[index].clone_ref(py))?;
+    Ok(d)
+}
+
+fn value_tag_byte(tag: ValueTag) -> u8 {
+    tag.as_u8()
+}
+
+fn hash_kind_byte(kind: HashKind) -> u8 {
+    kind.as_u8()
+}
+
+fn event_to_dict<'py>(py: Python<'py>, event: &Event) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("type_tag", event_tag_byte(event.tag()))?;
+    d.set_item("timestamp_delta_ns", event.timestamp_delta_ns())?;
+    match event {
+        Event::FunctionEntry(e) => {
+            d.set_item("type", "function_entry")?;
+            d.set_item("frame_id", e.frame_id)?;
+            d.set_item("function_id", e.function_id)?;
+            d.set_item("source_file_id", e.source_file_id)?;
+            d.set_item("line", e.line)?;
+            d.set_item(
+                "args",
+                e.args
+                    .iter()
+                    .map(|a| (a.name, a.value))
+                    .collect::<Vec<(u64, u64)>>(),
+            )?;
+        }
+        Event::FunctionExit(e) => {
+            d.set_item("type", "function_exit")?;
+            d.set_item("frame_id", e.frame_id)?;
+            d.set_item("return_value", e.return_value)?;
+        }
+        Event::FrameSnapshot(e) => {
+            d.set_item("type", "frame_snapshot")?;
+            d.set_item("frame_id", e.frame_id)?;
+            d.set_item("line", e.line)?;
+            d.set_item(
+                "locals",
+                e.locals
+                    .iter()
+                    .map(|l| (l.name, l.value))
+                    .collect::<Vec<(u64, u64)>>(),
+            )?;
+        }
+        Event::LineDelta(e) => {
+            d.set_item("type", "line_delta")?;
+            d.set_item("line", e.line)?;
+            d.set_item(
+                "changes",
+                e.changes
+                    .iter()
+                    .map(|c| (c.name, c.value))
+                    .collect::<Vec<(u64, u64)>>(),
+            )?;
+        }
+        Event::BranchResult(e) => {
+            d.set_item("type", "branch_result")?;
+            d.set_item("line", e.line)?;
+            d.set_item("taken", e.taken)?;
+        }
+        Event::ExceptionRaised(e) => {
+            d.set_item("type", "exception_raised")?;
+            d.set_item("line", e.line)?;
+            d.set_item("exception_type", e.exception_type)?;
+            d.set_item("exception_value", e.exception_value)?;
+        }
+        Event::Note(e) => {
+            d.set_item("type", "note")?;
+            d.set_item("line", e.line)?;
+            d.set_item("message", e.message)?;
+            d.set_item(
+                "kwargs",
+                e.kwargs
+                    .iter()
+                    .map(|k| (k.name, k.value))
+                    .collect::<Vec<(u64, u64)>>(),
+            )?;
+        }
+        Event::ScopeBoundary(e) => {
+            d.set_item("type", "scope_boundary")?;
+            d.set_item("boundary_type", e.boundary_type.as_u8())?;
+            d.set_item("reason", e.reason)?;
+        }
+        Event::FrameSwitch(e) => {
+            d.set_item("type", "frame_switch")?;
+            d.set_item("old_frame_id", e.old_frame_id)?;
+            d.set_item("new_frame_id", e.new_frame_id)?;
+            d.set_item("reason", e.reason.as_u8())?;
+        }
+    }
+    Ok(d)
+}
+
+fn event_tag_byte(tag: EventTag) -> u8 {
+    tag.as_u8()
+}
+
+// --- Module registration ----------------------------------------------------
+
+#[pymodule]
+fn hindsight_recorder(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyTraceWriter>()?;
+    m.add_function(wrap_pyfunction!(read_trace, m)?)?;
+    Ok(())
+}
+
+// --- Tests ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+
+    fn fresh_writer() -> hindsight_format::TraceWriter {
+        hindsight_format::TraceWriter::new(Metadata {
+            recorder: RecorderInfo {
+                language: "python".into(),
+                language_version: "3.12.5".into(),
+                recorder_version: "0.1.0".into(),
+                platform: "test".into(),
+            },
+            recording: RecordingInfo {
+                program: "pytest".into(),
+                working_directory: None,
+                scope_config: ScopeConfig::default(),
+            },
+            program: None,
+            trace_uuid: [0; 16],
+            recording_start_ns: 0,
+        })
+    }
+
+    /// Convenience: evaluate `src` as a Python expression, then convert it.
+    fn convert(py: Python<'_>, w: &mut hindsight_format::TraceWriter, src: &str) -> ValueId {
+        let code = CString::new(src).expect("source contains no null bytes");
+        let obj = py.eval(&code, None, None).expect("eval succeeds");
+        convert_value(w, &obj).expect("convert_value succeeds")
+    }
 
     #[test]
-    fn hello_world_returns_greeting() {
-        assert_eq!(hello_world(), "hello from hindsight-py");
+    fn none_returns_reserved_zero() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let id = convert(py, &mut w, "None");
+            assert_eq!(id, NONE_VALUE_ID);
+        });
+    }
+
+    #[test]
+    fn bool_distinct_from_int_zero_and_one() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let true_id = convert(py, &mut w, "True");
+            let false_id = convert(py, &mut w, "False");
+            let one_id = convert(py, &mut w, "1");
+            let zero_id = convert(py, &mut w, "0");
+            assert_ne!(true_id, one_id);
+            assert_ne!(false_id, zero_id);
+            // Self-dedup within a kind:
+            let true_again = convert(py, &mut w, "True");
+            assert_eq!(true_id, true_again);
+        });
+    }
+
+    #[test]
+    fn small_int_dedups() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let a = convert(py, &mut w, "42");
+            let b = convert(py, &mut w, "42");
+            assert_eq!(a, b);
+            let c = convert(py, &mut w, "43");
+            assert_ne!(a, c);
+        });
+    }
+
+    #[test]
+    fn big_int_path_takes_when_outside_i64() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let id_small = convert(py, &mut w, "9223372036854775807"); // i64::MAX
+            let id_too_big = convert(py, &mut w, "9223372036854775808"); // i64::MAX + 1
+            let id_two_pow_100 = convert(py, &mut w, "2 ** 100");
+            assert_ne!(id_small, id_too_big);
+            assert_ne!(id_too_big, id_two_pow_100);
+            // Round-trip via the reader requires a finalized trace; that's
+            // covered by the Python integration test. Here we just verify
+            // distinct IDs were produced.
+        });
+    }
+
+    #[test]
+    fn negative_big_int_takes_big_int_path() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            // -2**100 is comfortably outside i64.
+            let id_neg = convert(py, &mut w, "-(2 ** 100)");
+            let id_pos = convert(py, &mut w, "2 ** 100");
+            assert_ne!(id_neg, id_pos);
+        });
+    }
+
+    #[test]
+    fn float_path() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let a = convert(py, &mut w, "1.5");
+            let b = convert(py, &mut w, "1.5");
+            assert_eq!(a, b);
+            let c = convert(py, &mut w, "2.5");
+            assert_ne!(a, c);
+        });
+    }
+
+    #[test]
+    fn string_path() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let a = convert(py, &mut w, "'hello'");
+            let b = convert(py, &mut w, "'hello'");
+            assert_eq!(a, b);
+            let c = convert(py, &mut w, "'world'");
+            assert_ne!(a, c);
+        });
+    }
+
+    #[test]
+    fn bytes_path() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let a = convert(py, &mut w, "b'abc'");
+            let b = convert(py, &mut w, "b'abc'");
+            assert_eq!(a, b);
+        });
+    }
+
+    #[test]
+    fn empty_containers() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let l = convert(py, &mut w, "[]");
+            let t = convert(py, &mut w, "()");
+            // Empty list and empty tuple share Value::List([]).
+            assert_eq!(l, t);
+            let _d = convert(py, &mut w, "{}");
+            let _s = convert(py, &mut w, "set()");
+        });
+    }
+
+    #[test]
+    fn tuple_and_list_share_tag_and_dedup_when_equal() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let lst = convert(py, &mut w, "[1, 2, 3]");
+            let tup = convert(py, &mut w, "(1, 2, 3)");
+            // Both encode to Value::List with identical children.
+            assert_eq!(lst, tup);
+            let d = convert(py, &mut w, "{1: 2}");
+            assert_ne!(lst, d);
+        });
+    }
+
+    #[test]
+    fn nested_list_of_lists() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let outer = convert(py, &mut w, "[[1, 2], [3, 4]]");
+            let outer_again = convert(py, &mut w, "[[1, 2], [3, 4]]");
+            assert_eq!(outer, outer_again);
+            let inner = convert(py, &mut w, "[1, 2]");
+            assert_ne!(outer, inner);
+        });
+    }
+
+    #[test]
+    fn nested_dict_of_dicts() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let outer = convert(py, &mut w, "{'a': {'b': 1}, 'c': {'d': 2}}");
+            let outer_again = convert(py, &mut w, "{'a': {'b': 1}, 'c': {'d': 2}}");
+            assert_eq!(outer, outer_again);
+        });
+    }
+
+    #[test]
+    fn set_and_frozenset_both_encode_as_value_set() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let s = convert(py, &mut w, "{1, 2, 3}");
+            let fs = convert(py, &mut w, "frozenset({1, 2, 3})");
+            assert_eq!(s, fs);
+        });
+    }
+
+    #[test]
+    fn summary_fallback_for_arbitrary_class_instance_dedups_same_object() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            let code =
+                CString::new("type('Foo', (), {'__repr__': lambda self: 'foo()'})()").unwrap();
+            let obj = py.eval(&code, None, None).unwrap();
+            let id = convert_value(&mut w, &obj).unwrap();
+            let id2 = convert_value(&mut w, &obj).unwrap();
+            assert_eq!(id, id2);
+        });
+    }
+
+    #[test]
+    fn repr_truncation_dedups_distinct_instances_with_same_truncated_repr() {
+        Python::with_gil(|py| {
+            let mut w = fresh_writer();
+            // Two distinct instances of the same class, both whose reprs are
+            // 1000 'x' chars. After truncation to 256 chars the summaries
+            // are identical (same type_name, same truncated repr), so they
+            // dedup to a single value table entry.
+            let make = "type('Big', (), {'__repr__': lambda self: 'x' * 1000})";
+            let code_a = CString::new(format!("{make}()")).unwrap();
+            let code_b = CString::new(format!("{make}()")).unwrap();
+            let a = py.eval(&code_a, None, None).unwrap();
+            let b = py.eval(&code_b, None, None).unwrap();
+            let id_a = convert_value(&mut w, &a).unwrap();
+            let id_b = convert_value(&mut w, &b).unwrap();
+            assert_eq!(id_a, id_b);
+        });
     }
 }
