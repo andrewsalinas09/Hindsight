@@ -1,0 +1,11 @@
+[package]
+name = "hindsight-mcp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Model Context Protocol server exposing Hindsight debugging primitives."
+
+[dependencies]
+rmcp = "0.2"

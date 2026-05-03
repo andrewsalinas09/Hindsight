@@ -1,0 +1,11 @@
+[package]
+name = "hindsight-py"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PyO3 bindings exposing the Hindsight Rust core to the Python recorder."
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py312"] }

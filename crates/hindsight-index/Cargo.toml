@@ -1,0 +1,11 @@
+[package]
+name = "hindsight-index"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Indexes Hindsight trace files into an embedded DuckDB database."
+
+[dependencies]
+duckdb = { version = "1.1", features = ["bundled"] }
