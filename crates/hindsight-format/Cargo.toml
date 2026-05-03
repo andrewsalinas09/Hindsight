@@ -10,3 +10,6 @@ description = "Binary trace format reader and writer for Hindsight."
 [dependencies]
 arrow = "53"
 zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
+thiserror = "2"

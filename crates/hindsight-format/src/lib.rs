@@ -4,8 +4,8 @@
 //!
 //! Implementation will follow the spec in `docs/trace-format.md`.
 
-pub fn placeholder() -> &'static str {
-    "hindsight-format"
+pub fn hello_world() -> &'static str {
+    "hello from hindsight-format"
 }
 
 #[cfg(test)]
@@ -13,7 +13,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "hindsight-format");
+    fn hello_world_returns_greeting() {
+        assert_eq!(hello_world(), "hello from hindsight-format");
     }
 }

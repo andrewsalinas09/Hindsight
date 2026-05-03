@@ -2,8 +2,8 @@
 
 //! PyO3 bindings exposing the Hindsight Rust core to the Python recorder.
 
-pub fn placeholder() -> &'static str {
-    "hindsight-py"
+pub fn hello_world() -> &'static str {
+    "hello from hindsight-py"
 }
 
 #[cfg(test)]
@@ -11,7 +11,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "hindsight-py");
+    fn hello_world_returns_greeting() {
+        assert_eq!(hello_world(), "hello from hindsight-py");
     }
 }

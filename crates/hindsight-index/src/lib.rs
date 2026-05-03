@@ -2,8 +2,8 @@
 
 //! Indexes Hindsight trace files into an embedded DuckDB database.
 
-pub fn placeholder() -> &'static str {
-    "hindsight-index"
+pub fn hello_world() -> &'static str {
+    "hello from hindsight-index"
 }
 
 #[cfg(test)]
@@ -11,7 +11,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_returns_crate_name() {
-        assert_eq!(placeholder(), "hindsight-index");
+    fn hello_world_returns_greeting() {
+        assert_eq!(hello_world(), "hello from hindsight-index");
     }
 }

@@ -13,3 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+hindsight-format = { path = "../hindsight-format" }
+hindsight-index = { path = "../hindsight-index" }
+hindsight-mcp = { path = "../hindsight-mcp" }

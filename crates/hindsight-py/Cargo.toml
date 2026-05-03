@@ -7,5 +7,12 @@ license.workspace = true
 repository.workspace = true
 description = "PyO3 bindings exposing the Hindsight Rust core to the Python recorder."
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 pyo3 = { version = "0.23", features = ["abi3-py312"] }
+hindsight-format = { path = "../hindsight-format" }
+
+[features]
+extension-module = ["pyo3/extension-module"]
