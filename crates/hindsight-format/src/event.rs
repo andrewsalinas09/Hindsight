@@ -30,25 +30,25 @@ impl EventTag {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Argument {
     pub name: StringId,
     pub value: ValueId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Local {
     pub name: StringId,
     pub value: ValueId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
     pub name: StringId,
     pub value: ValueId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionEntry {
     pub timestamp_delta_ns: u64,
     pub frame_id: FrameId,
@@ -58,14 +58,14 @@ pub struct FunctionEntry {
     pub args: Vec<Argument>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionExit {
     pub timestamp_delta_ns: u64,
     pub frame_id: FrameId,
     pub return_value: ValueId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameSnapshot {
     pub timestamp_delta_ns: u64,
     pub frame_id: FrameId,
@@ -78,16 +78,16 @@ pub struct FrameSnapshot {
 /// `frame_id` explicit on all frame-scoped events including LINE_DELTA;
 /// when that lands, add the field here, in the payload writer below, and
 /// in the worked-example test that locks the on-disk byte layout.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineDelta {
     pub timestamp_delta_ns: u64,
     pub line: u32,
     pub changes: Vec<Change>,
 }
 
-/// One of the event types this writer can emit.
-#[derive(Debug, Clone)]
-pub(crate) enum Event {
+/// One of the event types this writer can emit and the reader can produce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
     FunctionEntry(FunctionEntry),
     FunctionExit(FunctionExit),
     FrameSnapshot(FrameSnapshot),
@@ -95,7 +95,7 @@ pub(crate) enum Event {
 }
 
 impl Event {
-    pub(crate) fn tag(&self) -> EventTag {
+    pub fn tag(&self) -> EventTag {
         match self {
             Event::FunctionEntry(_) => EventTag::FunctionEntry,
             Event::FunctionExit(_) => EventTag::FunctionExit,

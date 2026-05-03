@@ -24,6 +24,15 @@ impl HashKind {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x01 => Self::Content,
+            0x02 => Self::Summary,
+            0x03 => Self::Identity,
+            _ => return None,
+        })
+    }
 }
 
 /// On-disk type tag for a value. See spec §"Type tags".
@@ -50,11 +59,31 @@ impl ValueTag {
     pub fn as_u8(self) -> u8 {
         self as u8
     }
+
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x00 => Self::None,
+            0x01 => Self::Bool,
+            0x02 => Self::IntSmall,
+            0x03 => Self::IntBig,
+            0x04 => Self::Float,
+            0x05 => Self::String,
+            0x06 => Self::Bytes,
+            0x07 => Self::ListOrTuple,
+            0x08 => Self::Dict,
+            0x09 => Self::Set,
+            0x0A => Self::CycleRef,
+            0x10 => Self::Summary,
+            0x11 => Self::TypeRef,
+            0x12 => Self::ExceptionUnwindSentinel,
+            _ => return None,
+        })
+    }
 }
 
 /// A program value. Container variants reference other values by ID, which must
 /// already exist in the value table at intern time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     None,
     Bool(bool),

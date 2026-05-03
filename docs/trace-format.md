@@ -88,6 +88,8 @@ Length-prefixed binary blob containing recorder version, language metadata, comm
 +------------+------------+------------+
 ```
 
+**TODO(v0.3):** the diagram is ambiguous about whether `Length` covers the format-tag byte. The current writer/reader pair treats `Length` as **inclusive of the format tag** — payload is `Length - 1` bytes. Surfaced by the reader implementation; rewrite this diagram to make the convention explicit.
+
 Format tag indicates payload encoding:
 - `0x01`: TOML (UTF-8)
 - `0x02`: JSON (UTF-8)
@@ -216,6 +218,10 @@ Hash kind indicates what the hash represents:
 - `0x04`-`0xFF`: reserved.
 
 Length is the byte length of the encoded data, not including the type tag, hash kind, hash, or length prefix itself.
+
+**TODO(v0.3):** the spec doesn't say what a reader should do if `Length` exceeds the bytes the type tag's encoding consumes (i.e., trailing bytes inside the entry). The current reader treats this as an error. Codify this — strict-mode behavior in v0.x, possibly relaxed if a future revision adds optional trailing fields with their own length prefixes. Surfaced by the reader implementation.
+
+**TODO(v0.3):** the spec doesn't say whether container values (`list`, `tuple`, `set`, `dict`) may reference value IDs that haven't been defined yet at this point in the table (forward refs). The current writer never emits them and the current reader rejects them. Codify this as "all referenced IDs must be `< current_index`" unless we deliberately want to allow forward refs (e.g., to encode cycles without `cycle_ref`). Surfaced by the reader implementation.
 
 Why three hash kinds: content hash gives the strongest "is this the same value" answer but requires materializing the full content. For summarized values (large NumPy arrays, big DataFrames, deep object graphs), computing content hash defeats the purpose of summarization. Summary hash gives a weaker "the captured summary is the same" answer for summarized values. Identity hash gives "same object reference" which is useful for tracking mutation across function calls.
 
@@ -663,6 +669,8 @@ Subsequent events implicitly belong to the new frame. FRAME_SWITCH does not impl
 
 `0x0A`-`0xFF` are reserved for future use. Readers must skip unknown event types using the length prefix.
 
+**TODO(v0.3):** v0 readers (see `hindsight-format`) intentionally **reject** unknown event tags rather than skipping them, because the writer doesn't yet emit anything outside `0x01..=0x04` and a stray tag during v0 indicates a writer bug or corruption rather than a forward-compat scenario. This will flip to skip-with-warning once the writer supports the full event-type set; codify the transition condition here. Surfaced by the reader implementation.
+
 Specifically reserved:
 - `0x0A`: BRANCH_DETAIL — per-operand capture for compound conditions (planned for v0.3+)
 - `0x0B`: THREAD_SWITCH — multi-threaded recording context switch (planned for v1+)
@@ -693,6 +701,8 @@ The value table stores program values referenced by events. Each entry has a typ
 | `0x80`-`0xFF` | language-specific |                                                  |
 
 Tags `0x80`-`0xFF` are available for language-specific encodings. Each language frontend documents its tag assignments in a companion document.
+
+**TODO(v0.3):** the rows for `0x03` (int big), `0x05` (string), and `0x06` (bytes) describe the encoding as "length-prefixed", which is ambiguous about whether they carry a *second*, inner length prefix on top of the value-table-entry length. The current writer/reader pair treats them as **the value-table-entry length only** — no inner length, the encoded data fills the entry. Reword these rows to say "raw bytes (entry length bounds the run)" or similar. Surfaced by the reader implementation.
 
 ### Inlining vs. summarization
 
