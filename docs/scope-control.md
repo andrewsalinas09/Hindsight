@@ -10,7 +10,7 @@ We need to give the user a vocabulary that covers the natural cases without requ
 
 ## Levels of granularity
 
-There are seven levels of granularity, ordered from coarsest to finest, that v0 needs to support. All seven are in v0 because anything missing creates a class of problem the user can't solve, which means they bounce off the tool and don't come back.
+There are six levels of granularity that v0 needs to support, plus a depth parameter that controls how far recording recurses into callees. All of these are in v0 because anything missing creates a class of problem the user can't solve, which means they bounce off the tool and don't come back.
 
 The levels are:
 
@@ -18,15 +18,13 @@ The levels are:
 
 2. **Module or file.** Record only events in a particular file or module. Useful when the user knows the bug is in a specific source file and doesn't want noise from elsewhere.
 
-3. **Function.** Record only events inside a particular function, not its callees. Useful when the function itself is the suspicious unit and its callees are well-trusted.
+3. **Function with depth control.** Record a particular function, and optionally some number of levels of its callees. This is the most common case in practice and the depth parameter is what makes it flexible. `depth=0` records the function itself with no recursion into callees. `depth=1` records the function plus everything it directly calls. `depth=None` (the default) records the function and follows the call tree wherever it goes. Most users will use the default; the others are there for cases where the user wants to limit blast radius.
 
-4. **Function plus callees.** Record a function and everything it transitively calls. The most common case in practice — the bug is somewhere in this region of the program, and the user wants to follow the data wherever it goes.
+4. **Recording with exclusions.** Any of the above scopes, with patterns that suspend recording when execution enters certain functions or libraries. Handles "this function calls into numpy and I don't want to record numpy."
 
-5. **Function plus callees, with exclusions.** Record a function and its callees, but stop recording when execution enters certain functions or libraries. The case that handles "this function calls into numpy and I don't want to record numpy."
+5. **Region within a function.** Record a function but skip a specific block of code inside it. Handles "this function has a billion-iteration loop in the middle that I don't care about, but I do care about everything else in the function."
 
-6. **Region within a function.** Record a function but skip a specific block of code inside it. The case that handles "this function has a billion-iteration loop in the middle that I don't care about, but I do care about everything else in the function."
-
-7. **Conditional capture.** Record only when some predicate is true. "Only record this function when the input has more than 1000 elements," or "only record when this flag is set." Useful for debugging issues that only manifest in specific cases without paying the recording cost on the common path.
+6. **Conditional capture.** Record only when some predicate is true. "Only record this function when the input has more than 1000 elements," or "only record when this flag is set." Useful for debugging issues that only manifest in specific cases without paying the recording cost on the common path.
 
 ## The user-facing API
 
@@ -50,7 +48,25 @@ def main():
         process_request(req)
 ```
 
-These two forms are interchangeable. The decorator is sugar for the context manager applied to the function body. By default, this records level 4: the decorated/wrapped scope and everything it transitively calls.
+These two forms are interchangeable. The decorator is sugar for the context manager applied to the function body. By default, this records the decorated/wrapped scope and everything it transitively calls — equivalent to `depth=None`.
+
+To limit how far recording recurses, pass a `depth` argument:
+
+```python
+@hindsight.record(depth=0)   # just this function, no callees
+def process_request(req):
+    ...
+
+@hindsight.record(depth=1)   # this function plus its direct callees
+def process_request(req):
+    ...
+
+@hindsight.record(depth=None)  # this function and all transitive callees (default)
+def process_request(req):
+    ...
+```
+
+Depth is counted in call levels from the recorded scope. A function call from inside a recorded scope increases depth by one; returning decreases it. When depth exceeds the configured limit, recording suspends until execution returns to within the limit. Excluded functions don't count against the depth budget — they're skipped entirely, not consumed.
 
 ### Layer 2: include and exclude patterns
 
@@ -105,17 +121,17 @@ Per-call arguments get tedious for users who have consistent rules across their 
 ```toml
 [recording]
 exclude = [
-    "numpy.*",
-    "pandas.*",
-    "torch.*",
-    "logging.*",
-    "**/migrations/*",
+    "defaults",
+    "myapp.migrations.*",
+    "myapp.legacy.*",
 ]
 
 include = []  # empty means "include everything not excluded"
 ```
 
-The decorator and context manager merge these rules with anything specified at the call site. The user writes `@hindsight.record` without arguments and gets sensible project-wide behavior; they can override per-function as needed. Per-call arguments take precedence over the config file when they conflict — the user's explicit intent at the call site wins.
+The `defaults` token works the same way in the config file as it does in per-call arguments: it expands to the default exclusion list shipped with Hindsight. Users who want to start from scratch can simply omit it. Users who want to extend the defaults list it explicitly alongside their additions, as shown above.
+
+The decorator and context manager merge config-file rules with anything specified at the call site. The user writes `@hindsight.record` without arguments and gets the config-file behavior; per-call arguments take precedence over the config file when they conflict — the user's explicit intent at the call site wins.
 
 ### Layer 5: conditional recording
 
@@ -177,7 +193,16 @@ A new user who decorates a function and runs their program should get useful out
 - Test framework internals (`pytest`, `unittest`, `_pytest`)
 - Common dependencies of the above
 
-The default list is conservative — it excludes things almost everyone wants excluded. Users who want to record into these libraries can override per-call (`exclude=[]` to get nothing excluded) or in the config file. (`exclude=[defaults, numpyv2]` means the defaults and numpyv2 get excluded)
+The default list is conservative — it excludes things almost everyone wants excluded.
+
+The defaults are referenced by the special token `defaults` in any exclude list. This makes the relationship explicit:
+
+- `exclude=[]` means no exclusions at all, including dropping the defaults. Record everything.
+- `exclude=[defaults]` means use only the default exclusions. Same as not specifying `exclude` at all.
+- `exclude=[defaults, "myapp.helpers.*"]` means use the defaults plus an additional pattern.
+- `exclude=["myapp.helpers.*"]` means use only the user's pattern, dropping the defaults entirely.
+
+The token form removes the ambiguity of "does an empty list mean nothing-excluded or just-the-defaults." The user states their intent explicitly. Most users will write `exclude=[defaults, ...]` when they want to extend the defaults, which is the common case.
 
 The default list is shipped as a TOML file inside the package and is the source of truth. It will evolve as we learn what users actually want. Users can see what's currently in it via `hindsight defaults --show`.
 
@@ -196,7 +221,7 @@ When the user asks "what did we actually record" or "why isn't there data for th
 
 ## What's not in v0
 
-The seven granularity levels above are in v0. A few things adjacent to scope control are explicitly not:
+The six granularity levels above, with depth control on the function-scoped case, are all in v0. A few things adjacent to scope control are explicitly not:
 
 - **Sampling.** "Record 1 in 100 invocations of this function." Useful for production-style debugging but not necessary for the development-time use cases v0 targets.
 - **Time-budget-based recording.** "Record up to 30 seconds of execution, then stop." Solves a different problem (long-running programs) and adds complexity to the recorder's lifecycle.
@@ -235,17 +260,27 @@ def buggy():
     ...
 ```
 
-Records only functions in `myapp`, ignoring the default exclusions. Anything outside `myapp` is silently skipped.
+Records only functions in `myapp`, with no exclusions at all (including dropping the default exclusions). Anything outside `myapp` is silently skipped because of the include filter.
 
 **Surgical exclusion:**
 
 ```python
-@hindsight.record(exclude=["myapp.expensive_helper"])
+@hindsight.record(exclude=[defaults, "myapp.expensive_helper"])
 def buggy():
     ...
 ```
 
-Records `buggy` and its callees with default exclusions plus one specific helper that the user knows is expensive and uninteresting.
+Records `buggy` and its callees with the default exclusions plus one specific helper that the user knows is expensive and uninteresting.
+
+**Limiting recursion depth:**
+
+```python
+@hindsight.record(depth=1)
+def buggy():
+    ...
+```
+
+Records `buggy` and the functions it directly calls, but doesn't recurse further. Useful when the user wants to see what the immediate callees did without drowning in the deeper call tree.
 
 **Inline skip:**
 
@@ -290,6 +325,6 @@ These six patterns cover essentially every real debugging scenario.
 
 ## Summary
 
-Scope control in v0 supports seven granularity levels, expressed through a layered API: decorator and context manager for the basic case, include/exclude patterns for filtering, skip blocks for inline exclusion, a config file for project-wide rules, conditional predicates for selective recording, and CLI flags for whole-program scope. Default exclusions ship with the tool so the simple case works immediately. A metadata tool exposes scope decisions to the LLM so users can debug their scoping when it surprises them.
+Scope control in v0 supports six granularity levels with depth control for function-scoped recording, expressed through a layered API: decorator and context manager for the basic case, depth parameter for limiting recursion, include/exclude patterns for filtering, skip blocks for inline exclusion, a config file for project-wide rules, conditional predicates for selective recording, and CLI flags for whole-program scope. Default exclusions ship with the tool and are referenced by the explicit `defaults` token in user exclude lists, so users can extend or replace them unambiguously. A metadata tool exposes scope decisions to the LLM so users can debug their scoping when it surprises them.
 
 The design principle is that simple cases use the simple API and complex cases compose smaller pieces, with no cliff between them. Users should not have to read this document to use the tool — they should be able to write `@hindsight.record` and have something useful happen, then learn the rest as their needs grow.
