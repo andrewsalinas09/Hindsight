@@ -7,6 +7,9 @@ Public surface:
   recorded — every call, every line, every variable change — and a
   ``.hindsight`` trace file is written when the function returns. See
   ``ARCHITECTURE.md`` and ``docs/scope-control.md`` for the wider product.
+- ``with hindsight.skip():`` suspends recording for a block inside a
+  ``@record``-decorated function. Useful for excluding hot inner loops
+  the user doesn't care to trace.
 
 The lower-level building blocks are also available:
 
@@ -18,6 +21,6 @@ The lower-level building blocks are also available:
 from __future__ import annotations
 
 from ._core import TraceWriter, read_trace
-from ._recorder import record
+from ._recorder import record, skip
 
-__all__ = ["record", "TraceWriter", "read_trace"]
+__all__ = ["record", "skip", "TraceWriter", "read_trace"]

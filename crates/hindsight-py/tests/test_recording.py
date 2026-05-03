@@ -38,13 +38,19 @@ def _events_of(trace: dict, type_name: str) -> list[dict]:
     return [e for e in trace["events"] if e["type"] == type_name]
 
 
-def _function_entries_for(trace: dict, qualname: str) -> list[dict]:
-    """All FUNCTION_ENTRY events whose function_id resolves to ``qualname``."""
-    return [
-        e
-        for e in _events_of(trace, "function_entry")
-        if _string_at(trace, e["function_id"]) == qualname
-    ]
+def _function_entries_for(trace: dict, name: str) -> list[dict]:
+    """All FUNCTION_ENTRY events whose function_id resolves to either
+    the bare name or the fully-qualified name ending in ``.{name}``.
+
+    The recorder writes the fully-qualified name (module-prefixed); we
+    accept either form here so tests that only care about the function
+    name don't have to know the module."""
+    out = []
+    for e in _events_of(trace, "function_entry"):
+        full = _string_at(trace, e["function_id"])
+        if full == name or full.endswith(f".{name}"):
+            out.append(e)
+    return out
 
 
 @pytest.fixture
@@ -175,13 +181,12 @@ def test_nested_calls_get_separate_frame_ids(trace_path: Path):
 
     trace = hindsight.read_trace(str(trace_path))
 
-    entries = _events_of(trace, "function_entry")
-    qualnames = [_string_at(trace, e["function_id"]) for e in entries]
-    # caller_of_helper, then helper inside it.
-    assert "caller_of_helper" in qualnames
-    assert "helper" in qualnames
-    caller_entry = next(e for e in entries if _string_at(trace, e["function_id"]) == "caller_of_helper")
-    helper_entry = next(e for e in entries if _string_at(trace, e["function_id"]) == "helper")
+    caller_entries = _function_entries_for(trace, "caller_of_helper")
+    helper_entries = _function_entries_for(trace, "helper")
+    assert len(caller_entries) == 1
+    assert len(helper_entries) == 1
+    caller_entry = caller_entries[0]
+    helper_entry = helper_entries[0]
     assert caller_entry["frame_id"] != helper_entry["frame_id"]
 
     # caller's entry comes before helper's entry in the event stream;

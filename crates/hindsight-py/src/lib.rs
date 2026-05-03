@@ -28,9 +28,10 @@ use pyo3::types::{
 };
 
 use hindsight_format::{
-    Argument, Change, Event, EventTag, Finalization, FrameSnapshot, FunctionEntry, FunctionExit,
-    HashKind, LineDelta, Local, Metadata, NONE_VALUE_ID, ProgramInfo, RecorderInfo, RecordingInfo,
-    ScopeConfig, ScopeResolution, SourceFile, TraceReader, Value, ValueEntry, ValueId, ValueTag,
+    Argument, BoundaryType, Change, Event, EventTag, ExcludedFunction, Finalization, FrameSnapshot,
+    FunctionEntry, FunctionExit, HashKind, LineDelta, Local, Metadata, NONE_VALUE_ID, ProgramInfo,
+    RecorderInfo, RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, SourceFile,
+    TraceReader, Value, ValueEntry, ValueId, ValueTag,
 };
 
 /// Maximum char count we keep from `repr(obj)` when summarizing arbitrary
@@ -450,29 +451,129 @@ impl PyTraceWriter {
         .map_err(format_err)
     }
 
+    /// Write a SCOPE_BOUNDARY event. `boundary_type` is one of:
+    ///
+    /// - `0x01` entered_skip / `0x02` exited_skip — `hindsight.skip()` block boundary
+    /// - `0x03` entered_excluded / `0x04` exited_excluded — call to a function
+    ///   matched by an exclude pattern
+    /// - `0x05` entered_depth_clipped / `0x06` exited_depth_clipped — call past
+    ///   the configured `depth_limit`
+    ///
+    /// `reason` is a string ID for a free-form description (e.g.,
+    /// `"matched pattern: numpy.*"`). The Python recorder interns the
+    /// reason string itself before calling this.
+    fn write_scope_boundary(
+        &mut self,
+        timestamp_delta_ns: u64,
+        boundary_type: u8,
+        reason: u64,
+    ) -> PyResult<()> {
+        let bt = BoundaryType::from_u8(boundary_type).map_err(format_err)?;
+        let w = self.inner_mut()?;
+        w.write_scope_boundary(ScopeBoundary {
+            timestamp_delta_ns,
+            boundary_type: bt,
+            reason,
+        })
+        .map_err(format_err)
+    }
+
     /// Finalize the trace and write it to a file at `path`. After this call
     /// the writer is consumed; further methods raise `RuntimeError`.
-    fn finish(&mut self, path: PathBuf, recording_end_ns: u64) -> PyResult<()> {
+    ///
+    /// `scope_resolution` is the optional resolved scope info that lands in
+    /// the trace's final summary block (see `scope_resolution_from_dict`
+    /// for the dict shape). Pass `None` for an empty resolution; tests and
+    /// the v0 recorder always pass a populated dict.
+    #[pyo3(signature = (path, recording_end_ns, scope_resolution=None))]
+    fn finish(
+        &mut self,
+        path: PathBuf,
+        recording_end_ns: u64,
+        scope_resolution: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let resolution = match scope_resolution {
+            Some(d) => scope_resolution_from_dict(d)?,
+            None => ScopeResolution::default(),
+        };
         let writer = self.take_writer()?;
         let bytes = writer
-            .finish_to_bytes(default_finalization(recording_end_ns))
+            .finish_to_bytes(Finalization {
+                recording_end_ns,
+                scope_resolution: resolution,
+            })
             .map_err(format_err)?;
         std::fs::write(path, bytes).map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Finalize the trace and return its bytes. Convenience for in-memory
-    /// callers (tests).
+    /// callers (tests). See `finish` for `scope_resolution` semantics.
+    #[pyo3(signature = (recording_end_ns, scope_resolution=None))]
     fn finish_to_bytes<'py>(
         &mut self,
         py: Python<'py>,
         recording_end_ns: u64,
+        scope_resolution: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let resolution = match scope_resolution {
+            Some(d) => scope_resolution_from_dict(d)?,
+            None => ScopeResolution::default(),
+        };
         let writer = self.take_writer()?;
         let bytes = writer
-            .finish_to_bytes(default_finalization(recording_end_ns))
+            .finish_to_bytes(Finalization {
+                recording_end_ns,
+                scope_resolution: resolution,
+            })
             .map_err(format_err)?;
         Ok(PyBytes::new(py, &bytes))
     }
+}
+
+/// Convert the Python-side scope-resolution dict into the Rust struct.
+///
+/// Expected dict shape (any field may be omitted; missing fields default
+/// to empty/zero):
+/// ```python
+/// {
+///     "recorded_functions": [str, ...],
+///     "excluded_functions": [(name: str, matched_pattern: str), ...],
+///     "skip_blocks_observed": int,
+///     "depth_clips_observed": int,
+/// }
+/// ```
+fn scope_resolution_from_dict(d: &Bound<'_, PyDict>) -> PyResult<ScopeResolution> {
+    let recorded_functions: Vec<String> = match d.get_item("recorded_functions")? {
+        Some(v) if !v.is_none() => v.extract()?,
+        _ => Vec::new(),
+    };
+    let excluded_functions: Vec<ExcludedFunction> = match d.get_item("excluded_functions")? {
+        Some(v) if !v.is_none() => {
+            let pairs: Vec<(String, String)> = v.extract()?;
+            pairs
+                .into_iter()
+                .map(|(name, matched_pattern)| ExcludedFunction {
+                    name,
+                    matched_pattern,
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let skip_blocks_observed: u32 = match d.get_item("skip_blocks_observed")? {
+        Some(v) if !v.is_none() => v.extract()?,
+        _ => 0,
+    };
+    let depth_clips_observed: u32 = match d.get_item("depth_clips_observed")? {
+        Some(v) if !v.is_none() => v.extract()?,
+        _ => 0,
+    };
+    Ok(ScopeResolution {
+        recorded_functions,
+        excluded_functions,
+        skip_blocks_observed,
+        depth_clips_observed,
+    })
 }
 
 impl PyTraceWriter {
@@ -486,16 +587,6 @@ impl PyTraceWriter {
         self.inner
             .take()
             .ok_or_else(|| PyRuntimeError::new_err("TraceWriter has already been finished"))
-    }
-}
-
-fn default_finalization(recording_end_ns: u64) -> Finalization {
-    // Session A doesn't have scope-resolution data (the recorder hasn't been
-    // built yet). An empty `ScopeResolution` still produces a valid final
-    // summary block.
-    Finalization {
-        recording_end_ns,
-        scope_resolution: ScopeResolution::default(),
     }
 }
 
