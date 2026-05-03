@@ -28,10 +28,11 @@ use pyo3::types::{
 };
 
 use hindsight_format::{
-    Argument, BoundaryType, Change, Event, EventTag, ExcludedFunction, Finalization, FrameSnapshot,
-    FunctionEntry, FunctionExit, HashKind, LineDelta, Local, Metadata, NONE_VALUE_ID, ProgramInfo,
-    RecorderInfo, RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, SourceFile,
-    TraceReader, Value, ValueEntry, ValueId, ValueTag,
+    Argument, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, Event, EventTag,
+    ExceptionRaised, ExcludedFunction, Finalization, FrameSnapshot, FunctionEntry, FunctionExit,
+    HashKind, Kwarg, LineDelta, Local, Metadata, NONE_VALUE_ID, Note, ProgramInfo, RecorderInfo,
+    RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, SourceFile, TraceReader, Value,
+    ValueEntry, ValueId, ValueTag,
 };
 
 /// Maximum char count we keep from `repr(obj)` when summarizing arbitrary
@@ -449,6 +450,82 @@ impl PyTraceWriter {
                 .collect(),
         })
         .map_err(format_err)
+    }
+
+    /// Write a BRANCH_RESULT event. ``taken`` is the boolean truth value
+    /// of the branch's condition: ``True`` if the condition evaluated
+    /// truthy, ``False`` if falsy. The Python recorder computes this
+    /// from the BRANCH callback by disassembling the branch opcode and
+    /// comparing the destination offset to the next sequential offset.
+    fn write_branch_result(
+        &mut self,
+        timestamp_delta_ns: u64,
+        line: u32,
+        taken: bool,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_branch_result(BranchResult {
+            timestamp_delta_ns,
+            line,
+            taken,
+        })
+        .map_err(format_err)
+    }
+
+    /// Write an EXCEPTION_RAISED event. ``exception_type`` is a string
+    /// ID for the qualified exception class name (e.g.
+    /// ``"builtins.ValueError"``). ``exception_value`` is a value ID
+    /// for the exception instance summary.
+    fn write_exception_raised(
+        &mut self,
+        timestamp_delta_ns: u64,
+        line: u32,
+        exception_type: u64,
+        exception_value: u64,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_exception_raised(ExceptionRaised {
+            timestamp_delta_ns,
+            line,
+            exception_type,
+            exception_value,
+        })
+        .map_err(format_err)
+    }
+
+    /// Write a NOTE event (``hindsight.note(message, **kwargs)``).
+    /// ``message`` is a pre-interned string ID for the note's main
+    /// text. ``kwargs`` is a list of ``(name_string_id, value_id)``
+    /// pairs, mirroring the FUNCTION_ENTRY ``args`` format.
+    fn write_note(
+        &mut self,
+        timestamp_delta_ns: u64,
+        line: u32,
+        message: u64,
+        kwargs: Vec<(u64, u64)>,
+    ) -> PyResult<()> {
+        let w = self.inner_mut()?;
+        w.write_note(Note {
+            timestamp_delta_ns,
+            line,
+            message,
+            kwargs: kwargs
+                .into_iter()
+                .map(|(name, value)| Kwarg { name, value })
+                .collect(),
+        })
+        .map_err(format_err)
+    }
+
+    /// The reserved value ID for the "exception unwind sentinel" — the
+    /// return value to use in ``write_function_exit`` when a frame
+    /// exits via exception unwind rather than a normal return. Exposed
+    /// as a class attribute so the Python recorder doesn't have to
+    /// hardcode the constant.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn EXCEPTION_UNWIND_VALUE_ID() -> u64 {
+        EXCEPTION_UNWIND_VALUE_ID
     }
 
     /// Write a SCOPE_BOUNDARY event. `boundary_type` is one of:

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Recorder implementation: the @hindsight.record decorator and
-hindsight.skip() context manager.
+"""Recorder implementation: the @hindsight.record decorator,
+hindsight.skip() context manager, and hindsight.note() user-facing
+function.
 
 The recorder turns on ``sys.monitoring`` for the duration of a decorated
 function call, captures FUNCTION_ENTRY / FRAME_SNAPSHOT / LINE_DELTA /
-FUNCTION_EXIT events for everything in scope, emits SCOPE_BOUNDARY
-events at scope transitions, and writes a ``.hindsight`` trace file
-when the decorated function returns.
+FUNCTION_EXIT / BRANCH_RESULT / EXCEPTION_RAISED / NOTE events for
+everything in scope, emits SCOPE_BOUNDARY events at scope transitions,
+and writes a ``.hindsight`` trace file when the decorated function
+returns.
 
 Scope is determined per-frame at PY_START. A frame can be in one of
 four modes:
@@ -23,12 +25,14 @@ A frame's mode is sticky for its entire lifetime (decision (a) from the
 session brief: once a subtree is excluded, its descendants stay
 excluded — even if they'd match an include pattern individually).
 
-Out-of-scope for v0: BRANCH_RESULT and EXCEPTION_RAISED events,
-generators / coroutines, threads, the ``[capture]`` config section.
+Out-of-scope for v0: generators / coroutines, threads, the
+``[capture]`` config section, full exception lifecycle (RERAISE,
+EXCEPTION_HANDLED).
 """
 
 from __future__ import annotations
 
+import dis
 import functools
 import os
 import platform
@@ -42,7 +46,7 @@ from . import _config
 from ._config import ScopeConfig
 from ._core import TraceWriter
 
-__all__ = ["record", "skip"]
+__all__ = ["record", "skip", "note"]
 
 # --- sys.monitoring tool registration ---------------------------------------
 #
@@ -147,6 +151,7 @@ class _RecorderState:
         "excluded_records",
         "skip_blocks_observed",
         "depth_clips_observed",
+        "opname_cache",
     )
 
     def __init__(
@@ -173,6 +178,11 @@ class _RecorderState:
         self.excluded_records: list[tuple[str, str]] = []
         self.skip_blocks_observed: int = 0
         self.depth_clips_observed: int = 0
+        # Per-code opcode lookup cache used by the BRANCH callback to
+        # determine the polarity of jump-if-* instructions. Filled
+        # lazily on first BRANCH event for each code object.
+        # Keyed by id(code) → {offset: opname}.
+        self.opname_cache: dict[int, dict[int, str]] = {}
 
     def timestamp_delta_ns(self) -> int:
         now = time.time_ns()
@@ -391,6 +401,75 @@ def skip() -> _SkipContextManager:
     return _SkipContextManager()
 
 
+# --- The note() function ----------------------------------------------------
+
+
+def note(message: str, **kwargs: Any) -> None:
+    """Emit a NOTE event into the active trace.
+
+    Usage::
+
+        hindsight.note("processed batch", count=42, status="ok")
+
+    The note's source line comes from the immediate caller via
+    ``sys._getframe(1).f_lineno``. If a user wraps ``note()`` in their
+    own helper, the line will be the helper's line, not the helper's
+    caller's — for v0 we don't try to unwind further. Users who need
+    that can call ``sys._getframe(2).f_lineno`` themselves and
+    construct the note manually.
+
+    Outside an active ``@hindsight.record`` scope, this is a silent
+    no-op (no error, no warning).
+
+    The ``message`` is interned as a string. ``kwargs`` are interned as
+    ``(name, value)`` pairs. Values go through the same conversion
+    layer as captured locals — primitives inline, containers
+    recursively, anything else as a Summary fallback.
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback:
+        return
+    _in_callback = True
+    try:
+        # The caller's frame holds the source line we attribute the
+        # note to. We don't require the caller's frame to be RECORDING
+        # — note() is the user's *explicit* request to record an
+        # observation, so it fires whenever a recording session is
+        # active. (Notes from inside an excluded function are still
+        # interesting: they're the user telling us "this happened.")
+        try:
+            caller_frame = sys._getframe(1)
+            line = int(caller_frame.f_lineno)
+        except (ValueError, AttributeError):
+            line = 0
+
+        if not isinstance(message, str):
+            # Coerce — note() should be tolerant of non-string messages
+            # since users will pass things like format-string-built
+            # messages or repr'd values without thinking.
+            message = str(message)
+
+        message_id = state.writer.intern_string(message)
+        kw_pairs: list[tuple[int, int]] = []
+        for k, v in kwargs.items():
+            value_id = _safe_intern_value(state, v)
+            if value_id is None:
+                continue
+            kw_pairs.append((state.writer.intern_string(str(k)), value_id))
+
+        delta = state.timestamp_delta_ns()
+        state.writer.write_note(
+            timestamp_delta_ns=delta,
+            line=line,
+            message=message_id,
+            kwargs=kw_pairs,
+        )
+        state.event_count += 1
+    finally:
+        _in_callback = False
+
+
 # --- Skip-code computation --------------------------------------------------
 
 
@@ -407,7 +486,12 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _finalize,
         _on_py_start,
         _on_py_return,
+        _on_py_unwind,
         _on_line,
+        _on_branch,
+        _on_raise,
+        _opname_at,
+        _monitored_event_kinds,
         _resolve_mode_for_new_frame,
         _qualified_name,
         _capture_args,
@@ -415,6 +499,7 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _is_real_source_path,
         _build_metadata,
         _safe_intern_value,
+        note,
         _RecorderState.__init__,
         _RecorderState.timestamp_delta_ns,
         _RecorderState.alloc_frame_id,
@@ -435,15 +520,30 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
 # --- sys.monitoring lifecycle ----------------------------------------------
 
 
+def _monitored_event_kinds() -> tuple:
+    """The sys.monitoring event flags the recorder cares about. Defined
+    once so activate/deactivate stay in sync."""
+    e = sys.monitoring.events
+    return (e.PY_START, e.PY_RETURN, e.PY_UNWIND, e.LINE, e.BRANCH, e.RAISE)
+
+
 def _activate_monitoring() -> None:
     sys.monitoring.use_tool_id(_TOOL_ID, _TOOL_NAME)
     events = sys.monitoring.events
     sys.monitoring.register_callback(_TOOL_ID, events.PY_START, _on_py_start)
     sys.monitoring.register_callback(_TOOL_ID, events.PY_RETURN, _on_py_return)
+    # PY_UNWIND fires (instead of PY_RETURN) when a Python function
+    # exits via exception unwind. We need it to emit FUNCTION_EXIT with
+    # the EXCEPTION_UNWIND_VALUE_ID sentinel for unwound frames — without
+    # it we'd never see exits for exception paths.
+    sys.monitoring.register_callback(_TOOL_ID, events.PY_UNWIND, _on_py_unwind)
     sys.monitoring.register_callback(_TOOL_ID, events.LINE, _on_line)
-    sys.monitoring.set_events(
-        _TOOL_ID, events.PY_START | events.PY_RETURN | events.LINE
-    )
+    sys.monitoring.register_callback(_TOOL_ID, events.BRANCH, _on_branch)
+    sys.monitoring.register_callback(_TOOL_ID, events.RAISE, _on_raise)
+    mask = 0
+    for kind in _monitored_event_kinds():
+        mask |= kind
+    sys.monitoring.set_events(_TOOL_ID, mask)
 
 
 def _deactivate_monitoring() -> None:
@@ -452,8 +552,7 @@ def _deactivate_monitoring() -> None:
         sys.monitoring.set_events(_TOOL_ID, 0)
     except (ValueError, RuntimeError):
         pass
-    events = sys.monitoring.events
-    for ev in (events.PY_START, events.PY_RETURN, events.LINE):
+    for ev in _monitored_event_kinds():
         try:
             sys.monitoring.register_callback(_TOOL_ID, ev, None)
         except (ValueError, RuntimeError):
@@ -817,6 +916,191 @@ def _on_line(code: Any, line_number: int) -> Any:
         state.event_count += 1
     finally:
         _in_callback = False
+
+
+def _on_py_unwind(code: Any, instruction_offset: int, exception: BaseException) -> Any:
+    """PY_UNWIND — a Python function is exiting via exception unwind
+    (the function did not return normally; an exception is propagating
+    out). PY_RETURN does *not* fire for unwound frames, so this is the
+    only place we can emit a FUNCTION_EXIT for them.
+
+    We emit FUNCTION_EXIT with the reserved EXCEPTION_UNWIND_VALUE_ID
+    sentinel as the return value, per the trace format spec
+    §FUNCTION_EXIT: "If the exception propagates out of recorded
+    functions, FUNCTION_EXIT events are emitted for each unwound frame,
+    with the return value ID set to a special 'exception unwind'
+    sentinel value (always at value table index 1 by convention)."
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback or code in state.skip_codes:
+        return
+    _in_callback = True
+    try:
+        frame = sys._getframe(1)
+        frame_key = id(frame)
+        info = state.frame_info_by_pyframe.pop(frame_key, None)
+        if info is None:
+            state.last_value_id_by_local.pop(frame_key, None)
+            return
+        state.last_value_id_by_local.pop(frame_key, None)
+
+        if info.mode == _MODE_RECORDING:
+            delta = state.timestamp_delta_ns()
+            state.writer.write_function_exit(
+                timestamp_delta_ns=delta,
+                frame_id=info.frame_id,
+                return_value=TraceWriter.EXCEPTION_UNWIND_VALUE_ID,
+            )
+            state.event_count += 1
+            return
+
+        # Mirror PY_RETURN's behavior for non-recording modes: emit the
+        # exit boundary if we owned the entry boundary, else nothing.
+        if info.mode == _MODE_EXCLUDED and info.boundary_emitted_at_enter:
+            reason_str = (
+                f"matched pattern: {info.matched_pattern}"
+                if info.matched_pattern
+                else "excluded by config"
+            )
+            reason_id = state.writer.intern_string(reason_str)
+            delta = state.timestamp_delta_ns()
+            state.writer.write_scope_boundary(
+                delta, _BOUNDARY_EXITED_EXCLUDED, reason_id
+            )
+            state.event_count += 1
+            return
+        if info.mode == _MODE_DEPTH_CLIPPED and info.boundary_emitted_at_enter:
+            limit = state.config.depth_limit
+            reason_str = f"depth limit {limit} exceeded"
+            reason_id = state.writer.intern_string(reason_str)
+            delta = state.timestamp_delta_ns()
+            state.writer.write_scope_boundary(
+                delta, _BOUNDARY_EXITED_DEPTH_CLIPPED, reason_id
+            )
+            state.event_count += 1
+    finally:
+        _in_callback = False
+
+
+def _on_branch(code: Any, instruction_offset: int, destination_offset: int) -> Any:
+    """BRANCH — a conditional branch was evaluated.
+
+    In CPython 3.12 the BRANCH callback fires once per branch with the
+    actual ``destination_offset`` taken. To produce the BRANCH_RESULT
+    event's ``taken`` boolean (which the format spec defines as the
+    truth value of the condition, not "did we jump"), we look up the
+    opcode at ``instruction_offset`` and apply its polarity:
+
+    - ``POP_JUMP_IF_FALSE``: jumps when condition is falsy. Fell-through
+      → True (truthy); jumped → False.
+    - ``POP_JUMP_IF_TRUE``: opposite polarity.
+    - ``POP_JUMP_IF_NONE`` / ``_NOT_NONE``: ``True`` means "the condition
+      ``x is None`` evaluated truthy".
+    - Other branch opcodes (``FOR_ITER``, ``JUMP_BACKWARD``, comparison
+      branches, etc.): we fall back to "did we jump", and the LLM
+      consumer reads source for context.
+
+    This logic is 3.12-specific. Python 3.13 splits BRANCH into
+    ``BRANCH_LEFT`` / ``BRANCH_RIGHT``, which gives the answer
+    directly without disassembly. When we extend to 3.13+, prefer that
+    API.
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback or code in state.skip_codes:
+        return
+    _in_callback = True
+    try:
+        frame = sys._getframe(1)
+        info = state.frame_info_by_pyframe.get(id(frame))
+        if info is None or info.mode != _MODE_RECORDING:
+            return
+        if info.skip_depth > 0:
+            return
+        opname = _opname_at(state, code, instruction_offset)
+        # Fell-through means destination is the next sequential offset.
+        # All branch opcodes in 3.12 are 2 bytes (opcode + arg); inline
+        # caches don't change the instruction_offset → next_offset gap.
+        jumped = destination_offset != instruction_offset + 2
+        if opname == "POP_JUMP_IF_FALSE":
+            taken = not jumped
+        elif opname == "POP_JUMP_IF_TRUE":
+            taken = jumped
+        elif opname == "POP_JUMP_IF_NONE":
+            taken = jumped
+        elif opname == "POP_JUMP_IF_NOT_NONE":
+            taken = not jumped
+        else:
+            # Unknown / loop-style opcode. Report "did we jump."
+            taken = jumped
+        delta = state.timestamp_delta_ns()
+        state.writer.write_branch_result(
+            timestamp_delta_ns=delta,
+            line=frame.f_lineno,
+            taken=taken,
+        )
+        state.event_count += 1
+    finally:
+        _in_callback = False
+
+
+def _on_raise(code: Any, instruction_offset: int, exception: BaseException) -> Any:
+    """RAISE — an exception was raised (or re-raised). Per the brief,
+    this fires regardless of whether the exception is later caught.
+
+    We capture the qualified type name (``module.qualname``) and the
+    exception instance as a value (typically Summary-encoded since
+    user/builtin exceptions don't fit the inline primitive types).
+
+    Skip exceptions in non-recorded frames — they'll be observed via
+    the recorded ancestor's behavior (likely a PY_UNWIND emitting a
+    FUNCTION_EXIT with the unwind sentinel).
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback or code in state.skip_codes:
+        return
+    _in_callback = True
+    try:
+        frame = sys._getframe(1)
+        info = state.frame_info_by_pyframe.get(id(frame))
+        if info is None or info.mode != _MODE_RECORDING:
+            return
+        if info.skip_depth > 0:
+            return
+
+        exc_type = type(exception)
+        type_module = getattr(exc_type, "__module__", None) or "?"
+        type_qualname = getattr(exc_type, "__qualname__", None) or exc_type.__name__
+        type_str = f"{type_module}.{type_qualname}"
+
+        type_id = state.writer.intern_string(type_str)
+        value_id = _safe_intern_value(state, exception)
+        if value_id is None:
+            value_id = 0  # NONE_VALUE_ID — last-resort fallback.
+        delta = state.timestamp_delta_ns()
+        state.writer.write_exception_raised(
+            timestamp_delta_ns=delta,
+            line=frame.f_lineno,
+            exception_type=type_id,
+            exception_value=value_id,
+        )
+        state.event_count += 1
+    finally:
+        _in_callback = False
+
+
+def _opname_at(state: _RecorderState, code: Any, offset: int) -> str:
+    """Return the opcode name at ``offset`` in ``code``, cached per
+    code object on the state. Returns ``"UNKNOWN"`` if no instruction
+    starts at exactly that offset (shouldn't happen for offsets coming
+    from sys.monitoring callbacks)."""
+    table = state.opname_cache.get(id(code))
+    if table is None:
+        table = {inst.offset: inst.opname for inst in dis.get_instructions(code)}
+        state.opname_cache[id(code)] = table
+    return table.get(offset, "UNKNOWN")
 
 
 # --- Capture helpers --------------------------------------------------------
