@@ -31,6 +31,20 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Serve the MCP server against an already-indexed DuckDB database.
+    Serve {
+        /// Path to the indexed `.duckdb` file.
+        db: PathBuf,
+    },
+    /// Index a `.hindsight` trace if needed, then serve the MCP server.
+    /// One-command path for users who just want to start querying.
+    Debug {
+        /// Path to the `.hindsight` trace file.
+        trace: PathBuf,
+        /// Force re-indexing even if a `.duckdb` already exists alongside the trace.
+        #[arg(long)]
+        reindex: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -53,7 +67,47 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Serve { db } => match run_server(db) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("hindsight: serve failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Debug { trace, reindex } => {
+            let db_path = default_db_path(&trace);
+            if reindex || !db_path.exists() {
+                if let Err(e) = Indexer::index(&trace, &db_path) {
+                    eprintln!("hindsight: index failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+                eprintln!(
+                    "hindsight: indexed {} → {}",
+                    trace.display(),
+                    db_path.display()
+                );
+            } else {
+                eprintln!(
+                    "hindsight: reusing existing index at {} (pass --reindex to rebuild)",
+                    db_path.display()
+                );
+            }
+            match run_server(db_path) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("hindsight: serve failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
+}
+
+fn run_server(db: PathBuf) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move { hindsight_mcp::run_stdio(db).await.map_err(Into::into) })
 }
 
 /// Replace the trace's extension with `.duckdb`. If the trace has no
@@ -109,6 +163,31 @@ mod tests {
             Command::Index { ref trace, output: Some(ref out) }
                 if trace.as_os_str() == "trace.hindsight" && out.as_os_str() == "out.duckdb"
         ));
+    }
+
+    #[test]
+    fn serve_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hindsight", "serve", "out.duckdb"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Serve { ref db } if db.as_os_str() == "out.duckdb"
+        ));
+    }
+
+    #[test]
+    fn debug_subcommand_parses() {
+        let cli = Cli::try_parse_from(["hindsight", "debug", "trace.hindsight"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Debug { ref trace, reindex: false } if trace.as_os_str() == "trace.hindsight"
+        ));
+    }
+
+    #[test]
+    fn debug_subcommand_parses_with_reindex() {
+        let cli =
+            Cli::try_parse_from(["hindsight", "debug", "trace.hindsight", "--reindex"]).unwrap();
+        assert!(matches!(cli.command, Command::Debug { reindex: true, .. }));
     }
 
     #[test]

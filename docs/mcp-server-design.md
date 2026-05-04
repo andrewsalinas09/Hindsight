@@ -88,10 +88,12 @@ The composite `causal_slice` tool is the most expensive and should be reserved f
 ```
 
 **Implementation:**
-- Validate the query is read-only. Reject anything containing INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, ATTACH, or PRAGMA. Use DuckDB's parser if possible; fall back to keyword-based validation.
+- Validate the query is read-only. Reject anything containing INSERT, UPDATE, DELETE, DROP, CREATE, ALTER, ATTACH, or PRAGMA. Strip line and block comments before keyword matching so a write keyword inside `/* ... */` can't smuggle past the validator. Match keywords as whole words so column names like `created_at` aren't false positives.
 - Execute with a row limit equal to `max_rows + 1` to detect truncation.
 - Return structured rows. Include a `truncated` field so the LLM knows if results were cut off.
 - Catch SQL errors and return them in a structured way the LLM can react to.
+
+**Truncation semantics:** Rows beyond `max_rows` are dropped from the response and `truncated` is set to `true`. The query still runs to the (max_rows + 1)th row to detect overflow; the response never contains more than `max_rows` rows. Truncation is not an error — the LLM is expected to re-issue with a tighter `WHERE` or aggregation when it sees `truncated: true`.
 
 **Errors:** Return SQL errors as structured responses, not exceptions. The LLM will read the error and retry with corrected SQL.
 
@@ -173,12 +175,14 @@ The composite `causal_slice` tool is the most expensive and should be reserved f
 
 **The `context` field is what makes this tool earn its place.** Beyond just listing the variable's values, the tool fetches the source line for each capture and identifies other locals captured at the same event that might be relevant. The LLM gets the narrative timeline ready to convey, not raw rows to interpret.
 
+**`context` definition:** other names that appear in the source line of the capture, paired with their **most recent value at or before the capture's event_id** (walked back through `event_locals` if the name wasn't captured at the same event). The variable being traced is excluded from its own context. This gives the LLM "what was true at that line" rather than "what just happened to be re-captured at that event," which is the question the LLM is actually trying to answer.
+
 **Implementation:**
 - Query `event_locals` filtered by frame_id and name.
 - Join to `values` for the value details.
 - Join to `events` for the line number.
 - Look up the source line from `source_files`.
-- For each capture, fetch other locals captured at the same event_id (filter to a small set: locals with names that appear in the source line, or 1-2 step neighbors). This is the "context" enrichment.
+- For each capture, extract identifiers from the source line (skipping keywords, string literals, and comments), then walk-back through `event_locals` to find the most recent value of each identifier at or before this event. This is the "context" enrichment.
 - If `before_event_id` is set, filter captures to event_id <= that.
 
 ### `find_call(qualified_name, where=None, limit=10)`
@@ -359,11 +363,13 @@ The composite `causal_slice` tool is the most expensive and should be reserved f
 **Implementation:**
 - Find LINE_DELTA events on `loop_line` in `frame_id` ordered by event_id. Each is the start of an iteration.
 - For each iteration, the events between this LINE_DELTA and the next LINE_DELTA on the same line constitute the iteration body.
-- Within each iteration, find the loop variable change (the variable assigned at the loop header line — typically detectable as the local with the same line attribution).
+- Within each iteration, find the loop variable change (the variable assigned at the loop header line — typically detectable as the local captured on the loop-header LINE_DELTA itself).
 - Find other locals that changed within the iteration body.
 - Find branch results within the iteration body.
 
-**Edge case:** Loops that exit early (break) or are exited via exception have a final iteration that's incomplete. Handle gracefully — last iteration's body extends to the frame's exit_event_id.
+**Edge case — early exit:** Loops that exit early (break) or are exited via exception have a final iteration that's incomplete. Handle gracefully — the last iteration's body extends to the frame's exit_event_id.
+
+**Edge case — `while` loops with no obvious loop variable:** A `while cond:` header doesn't bind a name, so no local is captured on the loop-header LINE_DELTA. In that case `loop_variables` is returned as an empty list rather than failing the call — the iteration count and per-iteration `locals_changed` / `branches_taken` are still meaningful, and the LLM can fall back to those. The same shape applies to `for _ in ...:` patterns where Python's `_` rebind isn't captured as a tracked local.
 
 ### `exception_chain(event_id)`
 
@@ -504,6 +510,8 @@ The composite `causal_slice` tool is the most expensive and should be reserved f
 
 **Source parsing:** Use Python's `ast` module to parse the source line and extract `Name` nodes from the right-hand side. This handles most assignments cleanly. For complex expressions (calls, subscripts, attribute access), extract conservatively and note in the result what kind of dependency it is.
 
+**Cycle detection:** The cycle key for the visited-set must be `(frame_id, name, event_id)`, **not** `value_id`. CPython interns small integers and `None`/`True`/`False`, so the same `value_id` legitimately appears under multiple names — e.g., `largest = item` where both end up bound to the same interned `int 10` shares one `value_id`. Using `value_id` as the cycle key would incorrectly cut the walk short on the very first hop and report a false "cycle." Re-entering the same `(frame_id, name, event_id)` triple, by contrast, is a true value-flow cycle.
+
 **Limitations:** Can't follow dependencies through C extensions, side effects through mutated objects, or values produced by `eval`/`exec`. Note these in the output when detected.
 
 ## Implementation notes
@@ -512,9 +520,18 @@ The composite `causal_slice` tool is the most expensive and should be reserved f
 
 Use the `rmcp` Rust crate (current MCP SDK for Rust). Implement as a separate crate `crates/hindsight-mcp` in the workspace.
 
+**Pin to a specific rmcp version** (e.g. `rmcp = "=1.6.0"`) rather than a caret range. The crate is pre-1.0 in spirit — it's been moving fast, with breaking changes in macros, transport names, and `ServerHandler` signatures across minor versions. A floating dep risks silent build breakage on `cargo update`. When bumping rmcp, do it deliberately as its own change, alongside testing the macro output against the new version.
+
+### DuckDB integration quirks
+
+A few load-bearing gotchas the duckdb crate's docs don't shout about:
+
+- **`stmt.column_names()` panics if called before execution.** The schema isn't populated until the prepared statement is actually run, so `prepare → column_names()` panics with an `unwrap on None` deep inside duckdb's raw_statement. The right sequence is `prepare → query → rows.as_ref().map(|s| s.column_names())`. This bites `run_sql` directly since it needs to return column names alongside row data.
+- **`Connection` is `Send` but not `Sync`.** Hold it in `Arc<Mutex<Connection>>` for the life of the server. Tool calls serialize through the lock; this is acceptable for v0 since interactive debugging doesn't require concurrent queries.
+
 ### Database connection
 
-The server takes the path to an indexed DuckDB database as a startup argument or environment variable. Open it read-only. Hold the connection for the life of the server.
+The server takes the path to an indexed DuckDB database as a startup argument or environment variable. Open it read-only. (See also "DuckDB integration quirks" above for the `Connection` Sync/Mutex requirement.)
 
 ### Tool registration
 
