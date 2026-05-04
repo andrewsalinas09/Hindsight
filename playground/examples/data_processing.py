@@ -18,6 +18,10 @@ was at each LINE_DELTA inside the loop, vs. how many orders were seen.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "data_processing.hindsight")
+
 import hindsight
 
 

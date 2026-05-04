@@ -16,6 +16,10 @@ There's no bug here. The point is to query a real call tree:
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "recursion.hindsight")
+
 import hindsight
 
 

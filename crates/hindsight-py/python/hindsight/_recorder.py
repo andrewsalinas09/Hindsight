@@ -32,6 +32,7 @@ EXCEPTION_HANDLED).
 
 from __future__ import annotations
 
+import datetime
 import dis
 import functools
 import os
@@ -139,7 +140,7 @@ class _RecorderState:
         "output_path",
         "config",
         "recording_start_ns",
-        "_last_event_wall_ns",
+        "_last_event_perf_ns",
         "_next_frame_id",
         "frame_info_by_pyframe",
         "last_value_id_by_local",
@@ -160,8 +161,16 @@ class _RecorderState:
         skip_codes: frozenset,
         config: ScopeConfig,
     ) -> None:
+        # Wall-clock start, used for the trace's header and final summary
+        # so users can correlate to other logs / system timestamps.
         self.recording_start_ns = time.time_ns()
-        self._last_event_wall_ns = self.recording_start_ns
+        # Per-event deltas use perf_counter_ns, which is monotonic and
+        # high-resolution on every supported platform — including Windows,
+        # where time.time_ns() ticks at ~15 ms and would round small
+        # function durations down to zero. The two clocks have different
+        # origins, but per-event deltas only need monotonic spacing; the
+        # absolute wall-clock anchor lives in `recording_start_ns`.
+        self._last_event_perf_ns: int = time.perf_counter_ns()
         self.writer = TraceWriter(_build_metadata(self.recording_start_ns, config))
         self.output_path = output_path
         self.config = config
@@ -185,9 +194,9 @@ class _RecorderState:
         self.opname_cache: dict[int, dict[int, str]] = {}
 
     def timestamp_delta_ns(self) -> int:
-        now = time.time_ns()
-        delta = now - self._last_event_wall_ns
-        self._last_event_wall_ns = now
+        now = time.perf_counter_ns()
+        delta = now - self._last_event_perf_ns
+        self._last_event_perf_ns = now
         return delta if delta >= 0 else 0
 
     def alloc_frame_id(self) -> int:
@@ -263,13 +272,36 @@ def _build_metadata(start_ns: int, config: ScopeConfig) -> dict:
 # --- The decorator ----------------------------------------------------------
 
 
+def _default_trace_path() -> str:
+    """Build a fresh-per-recording default trace path.
+
+    Format: ``trace_YYYYMMDD_HHMMSS_NNNNNNNNN.hindsight`` where the tail
+    is the sub-second nanosecond component of the wall-clock start time.
+
+    Why not the previous ``trace.hindsight``: a function decorated with
+    ``@record`` and called twice in a row would silently overwrite its
+    own first trace, because each call finalizes a complete file. The
+    timestamped default makes "every recording is a fresh artifact" the
+    no-thought behavior. Users who want a stable name can set
+    ``HINDSIGHT_OUTPUT_PATH``.
+    """
+    ns = time.time_ns()
+    sec, sub = divmod(ns, 1_000_000_000)
+    dt = datetime.datetime.fromtimestamp(sec)
+    return f"trace_{dt.strftime('%Y%m%d_%H%M%S')}_{sub:09d}.hindsight"
+
+
 def record(func: Callable) -> Callable:
     """Decorate a function so calling it records a trace.
 
     The recorder reads ``hindsight.toml`` (resolved per ``_config``) at
     each call to obtain include/exclude patterns and ``depth_limit``.
-    The output path comes from ``$HINDSIGHT_OUTPUT_PATH`` or defaults
-    to ``./trace.hindsight``.
+
+    The output path comes from ``$HINDSIGHT_OUTPUT_PATH`` if set,
+    otherwise defaults to a unique-per-recording filename of the form
+    ``trace_YYYYMMDD_HHMMSS_NNNNNNNNN.hindsight`` in the current
+    directory (the trailing nanosecond component disambiguates back-to-
+    back recordings so they don't overwrite each other).
     """
 
     @functools.wraps(func)
@@ -281,7 +313,7 @@ def record(func: Callable) -> Callable:
             # supported — pass through to the underlying function.
             return func(*args, **kwargs)
 
-        output_path = os.environ.get("HINDSIGHT_OUTPUT_PATH", "trace.hindsight")
+        output_path = os.environ.get("HINDSIGHT_OUTPUT_PATH") or _default_trace_path()
         config = _config.load_config()
         skip_codes = _build_skip_codes(wrapper.__code__)
         state = _RecorderState(

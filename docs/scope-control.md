@@ -325,6 +325,68 @@ Records only functions matching the pattern across the whole program execution.
 
 These six patterns cover essentially every real debugging scenario.
 
+## Caveats when querying recorded names
+
+Two recorder behaviors are worth knowing about when you start writing
+SQL against the indexed trace, because they trip up users who assume
+the trace mirrors the source text more literally than it does.
+
+### Function names depend on how Python was invoked
+
+Functions appear in the trace under their *Python-runtime* qualified
+name, which is `frame.f_globals["__name__"]` plus `code.co_qualname`.
+That `__name__` depends on the invocation:
+
+- `python script.py` → `__name__` is `"__main__"`. A function `foo`
+  defined in `script.py` is recorded as `__main__.foo`.
+- `python -m mypkg.script` → same: the executed module is still
+  `__main__`. `foo` is again `__main__.foo`.
+- A function imported from another module — `from utils import
+  helper` — keeps its real module path, so it's recorded as
+  `utils.helper` regardless of how the entry-point script was invoked.
+
+The recorder is faithfully reporting what Python tells it; it doesn't
+synthesize a "nicer" qualified name. The practical consequence: when a
+user filters by `qualified_name = 'mypkg.script.foo'` and gets nothing
+back, they're hitting this. Filter on `source_file` instead — every
+event and frame row carries `source_file` denormalized, and source
+paths don't depend on invocation:
+
+```sql
+-- Less brittle than qualified_name when running as a script:
+SELECT * FROM frames WHERE source_file LIKE '%basic.py';
+```
+
+### BRANCH events may report a nearby source line, not the obvious one
+
+`sys.monitoring`'s BRANCH event is attributed to the source line of the
+branching opcode, which CPython's compiler chooses based on bytecode
+layout (PEP 657 location info). For straight-line `if` statements the
+line is what you'd expect; for short-circuit `and`/`or`, comparison
+chains, or branches that span source lines, the attribution can land
+on a line one or two over from the user's mental model.
+
+This isn't a recorder defect — `branches.line` is exactly what
+`sys.monitoring` reported. If a query for branches at the line you
+expect comes up empty, run:
+
+```sql
+SELECT DISTINCT line FROM branches WHERE source_file LIKE '%foo.py'
+ORDER BY line;
+```
+
+…to see which lines actually have branch rows, and broaden the filter
+to a small line range:
+
+```sql
+SELECT * FROM branches WHERE source_file LIKE '%foo.py'
+  AND line BETWEEN 27 AND 30;
+```
+
+A future tool layer (the MCP server's higher-level branch query) will
+fuzzy-match across nearby lines so users don't have to think about
+this; for now it's a filter to be explicit about.
+
 ## Summary
 
 Scope control in v0 supports six granularity levels with depth control for function-scoped recording, expressed through a layered API: decorator and context manager for the basic case, depth parameter for limiting recursion, include/exclude patterns for filtering, skip blocks for inline exclusion, a config file for project-wide rules, conditional predicates for selective recording, and CLI flags for whole-program scope. Default exclusions ship with the tool and are referenced by the explicit `defaults` token in user exclude lists, so users can extend or replace them unambiguously. A metadata tool exposes scope decisions to the LLM so users can debug their scoping when it surprises them.

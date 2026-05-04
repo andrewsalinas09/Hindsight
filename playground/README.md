@@ -62,33 +62,44 @@ The simplest thing to try:
 python examples/basic.py
 ```
 
-You'll see two lines of program output, then a one-liner from the
-recorder:
+You'll see two lines of program output, plus the recorder's
+finalization messages:
 
 ```
+hindsight: trace written to basic.hindsight (NN events)
+hindsight: trace written to basic.hindsight (NN events)
 clean run: 9
 buggy run: 10
-hindsight: trace written to trace.hindsight (NN events)
 ```
 
-The trace file landed in this directory. Now index it. The CLI binary
-lives in the workspace's `target/release/`; either set up an alias or
-call it by full path. From this directory:
+A note on the trace path: by default the recorder writes to a
+timestamped filename like `trace_20260503_201145_123456789.hindsight`
+so two recordings can't overwrite each other. The example programs in
+this playground each set `HINDSIGHT_OUTPUT_PATH` to a stable per-example
+name so the README can reference them directly — `basic.py` →
+`basic.hindsight`, `recursion.py` → `recursion.hindsight`, and so on.
+The second `@record` call inside `basic.py` *does* overwrite the first
+because both calls share the same env var; that's intentional here so
+the walkthrough has a known target file. To keep both traces from a
+single script, change `setdefault` to a fresh path between calls.
+
+Now index the trace. The CLI binary lives in the workspace's
+`target/release/`; either set up an alias or call it by full path:
 
 ```bash
-../target/release/hindsight index trace.hindsight
+../target/release/hindsight index basic.hindsight
 ```
 
 You'll see:
 
 ```
-Indexed trace.hindsight → trace.duckdb
+Indexed basic.hindsight → basic.duckdb
 ```
 
 Now query it. With the DuckDB CLI installed:
 
 ```bash
-duckdb trace.duckdb
+duckdb basic.duckdb
 ```
 
 That drops you at a SQL prompt. Try one of the queries from
@@ -116,7 +127,7 @@ Expected (your numbers may differ):
 If you don't have the DuckDB CLI, do the same query from Python:
 
 ```bash
-python -c "import duckdb; print(duckdb.connect('trace.duckdb').execute(
+python -c "import duckdb; print(duckdb.connect('basic.duckdb').execute(
   'SELECT type, COUNT(*) FROM events GROUP BY type ORDER BY 2 DESC'
 ).fetchall())"
 ```
@@ -128,7 +139,7 @@ python -c "import duckdb; print(duckdb.connect('trace.duckdb').execute(
 escaped into the comparison and the function silently returns
 `threshold` itself when it appears in the input. Let's catch it.
 
-Run the program (overwrites `trace.hindsight`):
+Run the program (writes `basic.hindsight`):
 
 ```bash
 python examples/basic.py
@@ -147,17 +158,14 @@ is 9. Something went wrong.
 Index and open:
 
 ```bash
-../target/release/hindsight index trace.hindsight
-duckdb trace.duckdb
+../target/release/hindsight index basic.hindsight
+duckdb basic.duckdb
 ```
 
-A subtle thing about the script: it calls `find_largest_below` *twice*,
-and each `@hindsight.record` call writes a fresh trace, so the second
-call's trace overwrites the first. `trace.hindsight` therefore contains
-just the buggy call. (If you want both, set `HINDSIGHT_OUTPUT_PATH`
-to a different filename around one of the calls.) The buggy call is
-`call_index = 0` in this trace because the recorder's frame counter
-resets per session:
+The script calls `find_largest_below` twice with the same
+`HINDSIGHT_OUTPUT_PATH`, so the second call's trace overwrites the
+first — `basic.hindsight` is the buggy call. `call_index = 0` because
+the recorder's frame counter resets per recording session:
 
 ```sql
 SELECT frame_id, depth, exit_kind, duration_ns, argument_summary
@@ -205,12 +213,14 @@ That's the workflow. Record, index, query, find.
   seeing how `frames.exit_kind` distinguishes `raised` (frames that
   unwound) from `returned` (the frame that caught it).
 
-For each: same workflow. Record, index, query.
+For each: same workflow. Record, index, query. The trace filename
+matches the example name (`recursion.py` → `recursion.hindsight` →
+`recursion.duckdb`).
 
 ```bash
 python examples/recursion.py
-../target/release/hindsight index trace.hindsight
-duckdb trace.duckdb
+../target/release/hindsight index recursion.hindsight
+duckdb recursion.duckdb
 ```
 
 ## The query collection
@@ -219,6 +229,32 @@ duckdb trace.duckdb
 through once — it's the fastest way to get a feel for what the schema
 makes easy. The full schema spec lives in `docs/indexer-schema.md` at
 the repo root.
+
+## Function names in queries
+
+Functions show up in the trace under their *Python-runtime* qualified
+name, which depends on how the program was invoked:
+
+- `python examples/basic.py` → `__name__` is `"__main__"`, so
+  `find_largest_below` is recorded as `__main__.find_largest_below`.
+- `python -m examples.basic` (with an `__init__.py` in `examples/`) →
+  same: the executed module is still `__main__`. The qualname doesn't
+  change.
+- A function imported from another module — e.g. `from utils import
+  helper; helper(...)` from inside the recorded scope — keeps its real
+  module path, so it shows up as `utils.helper`.
+
+This isn't the recorder making something up; it's exactly what
+`frame.f_globals["__name__"]` returns. The takeaway when you're
+filtering: the entry-point script's functions live under `__main__.*`,
+imported modules' functions live under their module path. If you're
+not sure which to use, query by source path instead — every event and
+frame row has `source_file` denormalized in:
+
+```sql
+SELECT * FROM frames WHERE source_file LIKE '%basic.py';
+SELECT * FROM events WHERE source_file LIKE '%basic.py' AND line = 28;
+```
 
 ## Tips for writing your own recorded code
 
@@ -234,9 +270,12 @@ the repo root.
   `exclude` blocks recording for noisy stdlib / third-party libs;
   it's almost always what you want. See `docs/scope-control.md` for
   the full vocabulary.
-- The recorder writes to `trace.hindsight` in the current directory by
-  default. Override with `HINDSIGHT_OUTPUT_PATH=foo.hindsight python ...`
-  if you want each run to a distinct file.
+- The recorder writes to a unique-per-recording file by default —
+  something like `trace_20260503_201145_123456789.hindsight` in the
+  current directory. The timestamp tail prevents back-to-back
+  recordings from silently overwriting each other. Override with
+  `HINDSIGHT_OUTPUT_PATH=foo.hindsight python ...` to pin a stable
+  name.
 
 ## When something goes wrong
 

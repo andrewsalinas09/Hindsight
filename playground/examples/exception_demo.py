@@ -20,6 +20,10 @@ frames to see which exit_kind each propagating frame ended with.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "exception_demo.hindsight")
+
 import hindsight
 
 

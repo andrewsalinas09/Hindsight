@@ -31,6 +31,21 @@ VENV_DIR="${SCRIPT_DIR}/.venv"
 
 cd "${SCRIPT_DIR}"
 
+# --- Hard prerequisites: Rust toolchain, Python 3.12+ ----------------------
+
+# We require cargo up-front. Both `maturin develop` (to build the Python
+# extension) and the indexer CLI need it, so a missing toolchain blocks
+# every part of the playground. Failing fast here is friendlier than
+# letting the user wait through the venv setup before maturin breaks.
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "ERROR: cargo not found on PATH." >&2
+    echo "Hindsight needs the Rust toolchain to build both the Python" >&2
+    echo "extension and the indexer CLI. Install it with rustup:" >&2
+    echo "    https://rustup.rs/" >&2
+    echo "...then re-run this script." >&2
+    exit 1
+fi
+
 # --- Find a Python 3.12+ interpreter ----------------------------------------
 
 # Search order: PYTHON env var, py launcher (Windows), python3.12, python3, python.
@@ -134,20 +149,16 @@ echo "Verifying installation..."
 # --- Build the indexer CLI (cargo) so the user can `hindsight index` -------
 #
 # The CLI lives in the workspace and isn't installed via pip. We build it
-# in the workspace target/ so `cargo run -p hindsight-cli` works fast.
+# in the workspace target/ so the playground has a ready-to-use binary.
+# (cargo presence was already verified at the top of this script.)
 
-if command -v cargo >/dev/null 2>&1; then
-    echo "Building hindsight CLI (cargo)..."
-    (cd "${WORKSPACE_ROOT}" && cargo build -p hindsight-cli --release)
-    CLI_BIN="${WORKSPACE_ROOT}/target/release/hindsight"
-    if [[ ! -f "${CLI_BIN}" && -f "${CLI_BIN}.exe" ]]; then
-        CLI_BIN="${CLI_BIN}.exe"
-    fi
-    echo "CLI built at: ${CLI_BIN}"
-else
-    echo "WARNING: cargo not found; skipping CLI build. Install Rust from https://rustup.rs/ then re-run." >&2
-    CLI_BIN="(cargo not found — install Rust)"
+echo "Building hindsight CLI (cargo)..."
+(cd "${WORKSPACE_ROOT}" && cargo build -p hindsight-cli --release)
+CLI_BIN="${WORKSPACE_ROOT}/target/release/hindsight"
+if [[ ! -f "${CLI_BIN}" && -f "${CLI_BIN}.exe" ]]; then
+    CLI_BIN="${CLI_BIN}.exe"
 fi
+echo "CLI built at: ${CLI_BIN}"
 
 # --- Next steps -------------------------------------------------------------
 

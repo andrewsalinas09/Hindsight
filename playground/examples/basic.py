@@ -16,6 +16,14 @@ update to the threshold itself.
 
 from __future__ import annotations
 
+import os
+
+# Pin a stable trace name so the playground walkthrough can reference
+# `basic.hindsight` directly. Without this, the recorder defaults to a
+# timestamped per-recording filename. `setdefault` keeps an explicit
+# user-set HINDSIGHT_OUTPUT_PATH winning.
+os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "basic.hindsight")
+
 import hindsight
 
 

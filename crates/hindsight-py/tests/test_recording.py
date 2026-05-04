@@ -328,18 +328,33 @@ def test_output_path_honors_hindsight_output_path_env(
     assert arg_values == [7, 8]
 
 
-def test_default_output_path_is_trace_hindsight_in_cwd(
+def test_default_output_path_is_unique_timestamp_in_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """With no env var set, the trace lands at ``./trace.hindsight`` in
-    the current working directory."""
+    """With no env var set, the trace lands in the current working
+    directory at a unique-per-recording path of the form
+    ``trace_YYYYMMDD_HHMMSS_NNNNNNNNN.hindsight``.
+
+    The timestamp prevents back-to-back ``@record`` calls from silently
+    overwriting one another's output."""
     monkeypatch.delenv("HINDSIGHT_OUTPUT_PATH", raising=False)
     monkeypatch.chdir(tmp_path)
 
     add_for_envvar(1, 2)
+    add_for_envvar(3, 4)
 
-    default_path = tmp_path / "trace.hindsight"
-    assert default_path.exists()
+    traces = sorted(tmp_path.glob("trace_*.hindsight"))
+    assert len(traces) == 2, (
+        f"expected two distinct trace files (one per recording), got {traces}"
+    )
+    # The legacy stable name must NOT appear by default — that was the
+    # silent-overwrite footgun this default fixes.
+    assert not (tmp_path / "trace.hindsight").exists()
+    # Sanity-check the filename shape.
+    import re
+    pattern = re.compile(r"^trace_\d{8}_\d{6}_\d{9}\.hindsight$")
+    for p in traces:
+        assert pattern.match(p.name), f"unexpected filename: {p.name}"
 
 
 def test_finalization_message_goes_to_stderr(

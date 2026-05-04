@@ -57,7 +57,7 @@ WHERE qualified_name = '__main__.find_largest_below'
 -- 4. Loop-iteration count for a specific frame.
 --
 -- Counts the LINE_DELTA events on a particular source line inside one
--- frame. A typical use: "how many times did the for-loop header at line 25
+-- frame. A typical use: "how many times did the for-loop header at line 33
 -- run during this call?" — once per iteration, since LINE fires at the
 -- start of each pass through the loop.
 -- ============================================================================
@@ -69,24 +69,29 @@ WHERE frame_id = (
           AND call_index = 0
       )
   AND type = 'line_delta'
-  AND line = 25;  -- adjust to the loop-body line you care about
+  AND line = 33;  -- the for-loop header in examples/basic.py
 
 
 -- ============================================================================
 -- 5. All branches at a specific source line, with their decisions.
 --
--- Useful for "which way did the if at line 29 (`if largest is None or
+-- Useful for "which way did the if at line 37 (`if largest is None or
 -- item > largest:`) go?" — one row per evaluation, with `taken`
--- reflecting the truth value of the condition. (Tip: if a line you
--- expect to see is missing, run `SELECT DISTINCT line FROM branches`
--- to see which lines the recorder actually attributed branches to —
--- short-circuit evaluation and Python's bytecode compilation can
--- shift the line a branch is reported on.)
+-- reflecting the truth value of the condition.
+--
+-- A real Python quirk: BRANCH events are attributed to the source line
+-- of the branching opcode, which the bytecode compiler chooses based
+-- on PEP 657 location info. For short-circuit `and`/`or` and some
+-- comparison forms, the line a branch reports on can shift one or two
+-- lines from the user's mental model. If a line you expect to see is
+-- missing, run `SELECT DISTINCT line FROM branches WHERE source_file
+-- LIKE '%basic.py' ORDER BY line` to see which lines actually have
+-- branch rows, and broaden your filter to a small range.
 -- ============================================================================
 SELECT event_id, function_name, line, taken, timestamp_ns
 FROM branches
 WHERE source_file LIKE '%basic.py'
-  AND line = 29
+  AND line = 37
 ORDER BY event_id;
 
 
