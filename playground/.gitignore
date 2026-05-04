@@ -1,0 +1,11 @@
+# Virtual environment created by setup.sh.
+.venv/
+
+# Trace and indexed-trace artifacts. The playground itself is committed;
+# the artifacts of running it are not.
+*.hindsight
+*.duckdb
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

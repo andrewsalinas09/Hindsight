@@ -1,0 +1,31 @@
+# Hindsight scope configuration for the playground.
+#
+# The recorder walks up from the current working directory looking for the
+# nearest hindsight.toml. With this file at playground/, running
+# `python examples/foo.py` from playground/ picks it up automatically.
+#
+# Schema (v0): a single [scope] table with three optional keys.
+
+[scope]
+# `include` is a positive filter: when non-empty, ONLY functions whose
+# qualified name (e.g. "examples.basic.find_largest_below") matches one of
+# these patterns get recorded. Leaving it empty means "record everything
+# that isn't excluded" — the right default for most playground experiments.
+include = []
+
+# `exclude` is a negative filter: any function whose qualified name matches
+# one of these patterns becomes a SCOPE_BOUNDARY in the trace, not a
+# recorded frame. The literal string "defaults" expands to a built-in
+# list of noisy stdlib / third-party names (numpy, pandas, logging,
+# asyncio, ...) — it's almost always what you want.
+#
+# Patterns use Python fnmatch syntax: `*` matches anything, `myapp.*`
+# matches anything with the `myapp.` prefix.
+exclude = ["defaults"]
+
+# `depth_limit` caps how many call-stack frames below the @record entry
+# point the recorder will descend into. Omit (or set to no value) for
+# unlimited depth, which is what you want for the small example programs
+# here. Set to e.g. 3 to limit blast radius when you're recording a
+# function that calls into a deep library.
+# depth_limit = 3
