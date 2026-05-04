@@ -9,12 +9,13 @@ mod common;
 use hindsight_mcp::HindsightServer;
 use hindsight_mcp::tools::{
     causal_slice, describe_schema, exception_chain, explain_branch, find_call, find_iterations,
-    get_call_tree, get_source, run_sql, trace_variable, why_did_value_change,
+    get_call_tree, get_source, list_traces, run_sql, trace_info, trace_variable,
+    why_did_value_change,
 };
 
 use common::{
-    build_basic_trace, build_data_processing_trace, build_exception_trace, build_minimal_trace,
-    build_recursion_trace, index_to_db,
+    TID, build_basic_trace, build_data_processing_trace, build_exception_trace,
+    build_minimal_trace, build_recursion_trace, index_to_db, registry_for,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,9 +23,9 @@ use common::{
 // ---------------------------------------------------------------------------
 
 #[test]
-fn server_registers_all_eleven_tools() {
-    let (db, _path) = index_to_db(&build_minimal_trace());
-    let server = HindsightServer::new(db);
+fn server_registers_all_thirteen_tools() {
+    let (registry, _trace_id) = registry_for(&build_minimal_trace());
+    let server = HindsightServer::new(registry);
     let mut names = server.list_tool_names();
     names.sort();
     let mut expected: Vec<String> = vec![
@@ -36,7 +37,9 @@ fn server_registers_all_eleven_tools() {
         "find_iterations",
         "get_call_tree",
         "get_source",
+        "list_traces",
         "run_sql",
+        "trace_info",
         "trace_variable",
         "why_did_value_change",
     ]
@@ -54,7 +57,7 @@ fn server_registers_all_eleven_tools() {
 #[test]
 fn describe_schema_returns_documented_tables_and_patterns() {
     let (db, _) = index_to_db(&build_minimal_trace());
-    let out = describe_schema::run(&db).unwrap();
+    let out = describe_schema::run(Some(&db)).unwrap();
     let names: Vec<&str> = out.tables.iter().map(|t| t.name.as_str()).collect();
     for must in [
         "events",
@@ -85,6 +88,7 @@ fn run_sql_returns_rows() {
     let out = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT COUNT(*) AS n FROM frames".into(),
             max_rows: None,
         },
@@ -101,6 +105,7 @@ fn run_sql_rejects_writes() {
     let err = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "INSERT INTO events VALUES (999, 'x', 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
                 .into(),
             max_rows: None,
@@ -116,6 +121,7 @@ fn run_sql_returns_structured_sql_error() {
     let err = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT not a real column FROM events".into(),
             max_rows: None,
         },
@@ -130,6 +136,7 @@ fn run_sql_truncates() {
     let out = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT event_id FROM events ORDER BY event_id".into(),
             max_rows: Some(2),
         },
@@ -149,6 +156,7 @@ fn get_source_returns_full_file() {
     let out = get_source::run(
         &db,
         get_source::GetSourceInput {
+            trace_id: TID.into(),
             file_path: "basic.py".into(),
             line_range: None,
         },
@@ -165,6 +173,7 @@ fn get_source_returns_window() {
     let out = get_source::run(
         &db,
         get_source::GetSourceInput {
+            trace_id: TID.into(),
             file_path: "basic.py".into(),
             line_range: Some([5, 10]),
         },
@@ -182,6 +191,7 @@ fn get_source_missing_file_returns_structured_error() {
     let err = get_source::run(
         &db,
         get_source::GetSourceInput {
+            trace_id: TID.into(),
             file_path: "nonexistent.py".into(),
             line_range: None,
         },
@@ -201,6 +211,7 @@ fn find_call_locates_the_buggy_run() {
     let out = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.find_largest_below".into(),
             r#where: None,
             limit: None,
@@ -218,6 +229,7 @@ fn find_call_missing_returns_unknown() {
     let out = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.does_not_exist".into(),
             r#where: None,
             limit: None,
@@ -233,6 +245,7 @@ fn find_call_filters_by_argument_contains() {
     let out = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.fib".into(),
             r#where: Some(find_call::FindCallWhere {
                 argument_contains: Some("n=2".into()),
@@ -262,6 +275,7 @@ fn trace_variable_returns_full_history() {
     let out = trace_variable::run(
         &db,
         trace_variable::TraceVariableInput {
+            trace_id: TID.into(),
             name: "largest".into(),
             frame_id: 0,
             before_event_id: None,
@@ -287,6 +301,7 @@ fn trace_variable_unknown_frame_returns_structured_error() {
     let err = trace_variable::run(
         &db,
         trace_variable::TraceVariableInput {
+            trace_id: TID.into(),
             name: "largest".into(),
             frame_id: 9999,
             before_event_id: None,
@@ -307,6 +322,7 @@ fn explain_branch_returns_locals_and_source() {
     let row = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT event_id FROM branches WHERE line = 9 AND taken = true ORDER BY event_id DESC LIMIT 1"
                 .into(),
             max_rows: None,
@@ -315,7 +331,14 @@ fn explain_branch_returns_locals_and_source() {
     .unwrap();
     let event_id = row.rows[0][0].as_i64().unwrap();
 
-    let out = explain_branch::run(&db, explain_branch::ExplainBranchInput { event_id }).unwrap();
+    let out = explain_branch::run(
+        &db,
+        explain_branch::ExplainBranchInput {
+            trace_id: TID.into(),
+            event_id,
+        },
+    )
+    .unwrap();
     assert!(out.taken);
     assert_eq!(out.line, 9);
     // Locals should include `largest` and `item`.
@@ -330,7 +353,10 @@ fn explain_branch_unknown_event_returns_error() {
     let (db, _) = index_to_db(&build_basic_trace());
     let err = explain_branch::run(
         &db,
-        explain_branch::ExplainBranchInput { event_id: 999_999 },
+        explain_branch::ExplainBranchInput {
+            trace_id: TID.into(),
+            event_id: 999_999,
+        },
     )
     .unwrap_err();
     assert_eq!(err.error, "branch_not_found");
@@ -346,6 +372,7 @@ fn why_did_value_change_explains_the_buggy_assignment() {
     let row = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT MAX(event_id) FROM events".into(),
             max_rows: None,
         },
@@ -356,6 +383,7 @@ fn why_did_value_change_explains_the_buggy_assignment() {
     let out = why_did_value_change::run(
         &db,
         why_did_value_change::WhyDidValueChangeInput {
+            trace_id: TID.into(),
             name: "largest".into(),
             frame_id: 0,
             around_event_id: around,
@@ -382,6 +410,7 @@ fn find_iterations_returns_six_iterations() {
     let out = find_iterations::run(
         &db,
         find_iterations::FindIterationsInput {
+            trace_id: TID.into(),
             frame_id: 0,
             loop_line: 7,
         },
@@ -412,6 +441,7 @@ fn exception_chain_walks_three_frames_and_finds_catcher() {
     let row = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT event_id FROM exceptions ORDER BY event_id LIMIT 1".into(),
             max_rows: None,
         },
@@ -419,7 +449,14 @@ fn exception_chain_walks_three_frames_and_finds_catcher() {
     .unwrap();
     let event_id = row.rows[0][0].as_i64().unwrap();
 
-    let out = exception_chain::run(&db, exception_chain::ExceptionChainInput { event_id }).unwrap();
+    let out = exception_chain::run(
+        &db,
+        exception_chain::ExceptionChainInput {
+            trace_id: TID.into(),
+            event_id,
+        },
+    )
+    .unwrap();
     assert_eq!(out.exception_type, "builtins.ValueError");
     assert_eq!(out.propagation.len(), 3);
     assert!(out.ultimately_caught);
@@ -440,6 +477,7 @@ fn get_call_tree_returns_recursive_structure() {
     let out = get_call_tree::run(
         &db,
         get_call_tree::GetCallTreeInput {
+            trace_id: TID.into(),
             frame_id: 0,
             max_depth: None,
             include_args: true,
@@ -460,6 +498,7 @@ fn get_call_tree_respects_max_depth() {
     let out = get_call_tree::run(
         &db,
         get_call_tree::GetCallTreeInput {
+            trace_id: TID.into(),
             frame_id: 0,
             max_depth: Some(1),
             include_args: true,
@@ -477,6 +516,7 @@ fn get_call_tree_unknown_frame_errors() {
     let err = get_call_tree::run(
         &db,
         get_call_tree::GetCallTreeInput {
+            trace_id: TID.into(),
             frame_id: 9999,
             max_depth: None,
             include_args: true,
@@ -497,6 +537,7 @@ fn causal_slice_walks_from_largest_back_to_args() {
     let row = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT value_id FROM values WHERE type_tag = 'int' AND int_value = 10 LIMIT 1"
                 .into(),
             max_rows: None,
@@ -507,6 +548,7 @@ fn causal_slice_walks_from_largest_back_to_args() {
     let out = causal_slice::run(
         &db,
         causal_slice::CausalSliceInput {
+            trace_id: TID.into(),
             value_id,
             max_depth: Some(3),
         },
@@ -532,6 +574,7 @@ fn causal_slice_invalid_value_returns_error() {
     let err = causal_slice::run(
         &db,
         causal_slice::CausalSliceInput {
+            trace_id: TID.into(),
             value_id: i64::MAX,
             max_depth: None,
         },
@@ -550,10 +593,130 @@ fn data_processing_fixture_indexes() {
     let out = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT COUNT(*) FROM frames".into(),
             max_rows: None,
         },
     )
     .unwrap();
     assert_eq!(out.row_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// list_traces / trace_info — multi-trace registry behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_traces_returns_one_entry_for_single_trace_registry() {
+    let (registry, trace_id) = registry_for(&build_basic_trace());
+    let out = list_traces::run(&registry, list_traces::ListTracesInput {}).unwrap();
+    assert_eq!(out.traces.len(), 1);
+    assert_eq!(out.traces[0].trace_id, trace_id);
+    // The trace hasn't been touched yet — indexed should be false.
+    assert!(!out.traces[0].indexed);
+    assert_eq!(out.traces[0].program.as_deref(), Some("python demo.py"));
+    assert!(out.traces[0].size_bytes > 0);
+    // Directory mode: directory is set.
+    assert!(out.directory.is_some());
+}
+
+#[test]
+fn list_traces_with_two_traces_returns_them_sorted_newest_first() {
+    use std::sync::Arc;
+
+    use hindsight_mcp::TraceRegistry;
+    let dir = std::env::temp_dir().join(format!(
+        "hindsight-mcp-list-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Two trace files; the basic fixture starts at 1_000ns, the recursion
+    // fixture at 0ns — so basic should come first when sorted newest-first.
+    std::fs::write(dir.join("a.hindsight"), build_recursion_trace()).unwrap();
+    std::fs::write(dir.join("b.hindsight"), build_basic_trace()).unwrap();
+    let registry = Arc::new(TraceRegistry::from_directory(dir).unwrap());
+    let out = list_traces::run(&registry, list_traces::ListTracesInput {}).unwrap();
+    assert_eq!(out.traces.len(), 2);
+    assert_eq!(out.traces[0].trace_id, "b"); // basic (1_000ns) is newer
+    assert_eq!(out.traces[1].trace_id, "a");
+}
+
+#[test]
+fn trace_info_returns_metadata_for_known_trace() {
+    let (registry, trace_id) = registry_for(&build_basic_trace());
+    let out = trace_info::run(
+        &registry,
+        trace_info::TraceInfoInput {
+            trace_id: trace_id.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(out.trace_id, trace_id);
+    assert_eq!(out.recorder_language.as_deref(), Some("python"));
+    assert!(out.recorded_at_ns.is_some());
+    assert!(out.event_count.unwrap_or(0) > 0);
+}
+
+#[test]
+fn trace_info_unknown_trace_returns_structured_error() {
+    let (registry, _) = registry_for(&build_basic_trace());
+    let err = trace_info::run(
+        &registry,
+        trace_info::TraceInfoInput {
+            trace_id: "no-such-trace".into(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.error, "trace_not_found");
+}
+
+#[test]
+fn registry_lazy_indexes_and_caches_connection() {
+    use hindsight_mcp::TraceRegistry;
+    let dir = std::env::temp_dir().join(format!(
+        "hindsight-mcp-lazy-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("trace_a.hindsight"), build_basic_trace()).unwrap();
+    let registry = TraceRegistry::from_directory(dir.clone()).unwrap();
+
+    // No .duckdb yet.
+    assert!(!dir.join("trace_a.duckdb").exists());
+
+    // First get_or_open triggers indexing.
+    let conn1 = registry.get_or_open("trace_a").unwrap();
+    assert!(dir.join("trace_a.duckdb").exists());
+
+    // Subsequent get_or_open returns the cached connection (same Arc inside).
+    let conn2 = registry.get_or_open("trace_a").unwrap();
+
+    // Both connections work.
+    let n1: i64 = conn1
+        .lock()
+        .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
+        .unwrap();
+    let n2: i64 = conn2
+        .lock()
+        .query_row("SELECT COUNT(*) FROM frames", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n1, n2);
+    assert!(n1 > 0);
+}
+
+#[test]
+fn registry_unknown_trace_id_returns_error() {
+    let (registry, _) = registry_for(&build_basic_trace());
+    let result = registry.get_or_open("does-not-exist");
+    let err = match result {
+        Ok(_) => panic!("expected error for unknown trace_id"),
+        Err(e) => e,
+    };
+    assert_eq!(err.error, "trace_not_found");
 }

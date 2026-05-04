@@ -278,17 +278,47 @@ def _default_trace_path() -> str:
     Format: ``trace_YYYYMMDD_HHMMSS_NNNNNNNNN.hindsight`` where the tail
     is the sub-second nanosecond component of the wall-clock start time.
 
-    Why not the previous ``trace.hindsight``: a function decorated with
-    ``@record`` and called twice in a row would silently overwrite its
-    own first trace, because each call finalizes a complete file. The
-    timestamped default makes "every recording is a fresh artifact" the
-    no-thought behavior. Users who want a stable name can set
+    Resolution:
+
+    1. If ``HINDSIGHT_TRACES_DIR`` is set, write the file inside that
+       directory.
+    2. Otherwise, default to ``~/.hindsight/traces/`` (created on demand).
+       The MCP server points at the same location by default, so any
+       trace produced by ``@hindsight.record`` is immediately discoverable
+       via ``list_traces``.
+
+    Why not the previous in-cwd ``trace.hindsight``: a function decorated
+    with ``@record`` and called twice in a row would silently overwrite
+    its own first trace, because each call finalizes a complete file.
+    The timestamped default makes "every recording is a fresh artifact"
+    the no-thought behavior. Users who want a stable name can set
     ``HINDSIGHT_OUTPUT_PATH``.
     """
     ns = time.time_ns()
     sec, sub = divmod(ns, 1_000_000_000)
     dt = datetime.datetime.fromtimestamp(sec)
-    return f"trace_{dt.strftime('%Y%m%d_%H%M%S')}_{sub:09d}.hindsight"
+    filename = f"trace_{dt.strftime('%Y%m%d_%H%M%S')}_{sub:09d}.hindsight"
+
+    traces_dir_env = os.environ.get("HINDSIGHT_TRACES_DIR")
+    if traces_dir_env:
+        traces_dir = traces_dir_env
+    else:
+        home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+        if not home:
+            # No home dir we can find — fall back to cwd so the recorder
+            # still produces output rather than crashing on a config
+            # gap. This matches the previous default for environments
+            # without a HOME.
+            return filename
+        traces_dir = os.path.join(home, ".hindsight", "traces")
+
+    try:
+        os.makedirs(traces_dir, exist_ok=True)
+    except OSError:
+        # Couldn't create the directory (permissions, read-only FS, etc.)
+        # — degrade to cwd rather than crashing the recording.
+        return filename
+    return os.path.join(traces_dir, filename)
 
 
 def record(func: Callable) -> Callable:

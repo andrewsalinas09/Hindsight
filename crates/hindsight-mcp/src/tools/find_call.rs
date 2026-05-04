@@ -28,6 +28,7 @@ pub struct FindCallWhere {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindCallInput {
+    pub trace_id: String,
     pub qualified_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub r#where: Option<FindCallWhere>,

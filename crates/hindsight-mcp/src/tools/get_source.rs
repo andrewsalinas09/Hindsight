@@ -10,6 +10,8 @@ use crate::source::{fetch_source_content, list_source_paths, slice_lines};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GetSourceInput {
+    /// Trace to read source from.
+    pub trace_id: String,
     /// File path as stored in the trace (matches `events.source_file`).
     pub file_path: String,
     /// Optional 1-indexed inclusive `[start, end]` line range. Omit to

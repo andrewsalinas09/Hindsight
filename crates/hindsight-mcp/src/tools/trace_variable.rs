@@ -15,6 +15,7 @@ use crate::value::{ValueSummary, fetch_value_summaries};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct TraceVariableInput {
+    pub trace_id: String,
     pub name: String,
     pub frame_id: i64,
     /// If specified, only returns captures at or before this event.

@@ -13,6 +13,7 @@ use crate::value::{ValueSummary, fetch_value_summaries};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FindIterationsInput {
+    pub trace_id: String,
     pub frame_id: i64,
     /// Source line of the loop header (the `for ...` or `while ...` line).
     pub loop_line: i32,

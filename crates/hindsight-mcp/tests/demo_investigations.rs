@@ -19,8 +19,8 @@ use hindsight_mcp::tools::{
 };
 
 use common::{
-    build_basic_trace, build_data_processing_trace, build_exception_trace, build_recursion_trace,
-    index_to_db,
+    TID, build_basic_trace, build_data_processing_trace, build_exception_trace,
+    build_recursion_trace, index_to_db,
 };
 
 fn dump<T: serde::Serialize>(label: &str, v: &T) {
@@ -42,6 +42,7 @@ fn investigation_1_off_by_one_bug() {
     let calls = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.find_largest_below".into(),
             r#where: Some(find_call::FindCallWhere {
                 argument_contains: Some("threshold=10".into()),
@@ -59,6 +60,7 @@ fn investigation_1_off_by_one_bug() {
     let history = trace_variable::run(
         &db,
         trace_variable::TraceVariableInput {
+            trace_id: TID.into(),
             name: "largest".into(),
             frame_id,
             before_event_id: None,
@@ -78,6 +80,7 @@ fn investigation_1_off_by_one_bug() {
     let why = why_did_value_change::run(
         &db,
         why_did_value_change::WhyDidValueChangeInput {
+            trace_id: TID.into(),
             name: "largest".into(),
             frame_id,
             around_event_id: last_event,
@@ -97,6 +100,7 @@ fn investigation_1_off_by_one_bug() {
     let source = get_source::run(
         &db,
         get_source::GetSourceInput {
+            trace_id: TID.into(),
             file_path: "basic.py".into(),
             line_range: Some([5, 12]),
         },
@@ -122,6 +126,7 @@ fn investigation_2_recursion_redundancy() {
     let distribution = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT v.int_value AS n, COUNT(*) AS calls FROM frames f \
                     JOIN event_args ea ON f.entry_event_id = ea.event_id \
                     JOIN values v ON ea.value_id = v.value_id \
@@ -139,6 +144,7 @@ fn investigation_2_recursion_redundancy() {
     let total = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT COUNT(*) AS total FROM frames WHERE qualified_name = '__main__.fib'"
                 .into(),
             max_rows: None,
@@ -153,6 +159,7 @@ fn investigation_2_recursion_redundancy() {
     let calls = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.main".into(),
             r#where: None,
             limit: Some(1),
@@ -163,6 +170,7 @@ fn investigation_2_recursion_redundancy() {
     let tree = get_call_tree::run(
         &db,
         get_call_tree::GetCallTreeInput {
+            trace_id: TID.into(),
             frame_id: main_frame,
             max_depth: None,
             include_args: true,
@@ -188,6 +196,7 @@ fn investigation_3_exception_chain() {
     let raises = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query: "SELECT event_id, exception_type FROM exceptions ORDER BY event_id LIMIT 5"
                 .into(),
             max_rows: None,
@@ -201,6 +210,7 @@ fn investigation_3_exception_chain() {
     let chain = exception_chain::run(
         &db,
         exception_chain::ExceptionChainInput {
+            trace_id: TID.into(),
             event_id: first_event_id,
         },
     )
@@ -228,6 +238,7 @@ fn investigation_4_data_processing_bug() {
     let calls = find_call::run(
         &db,
         find_call::FindCallInput {
+            trace_id: TID.into(),
             qualified_name: "__main__.sum_shipped_revenue".into(),
             r#where: None,
             limit: None,
@@ -242,6 +253,7 @@ fn investigation_4_data_processing_bug() {
     let revenue_history = trace_variable::run(
         &db,
         trace_variable::TraceVariableInput {
+            trace_id: TID.into(),
             name: "revenue".into(),
             frame_id,
             before_event_id: None,
@@ -257,6 +269,7 @@ fn investigation_4_data_processing_bug() {
     let iters = find_iterations::run(
         &db,
         find_iterations::FindIterationsInput {
+            trace_id: TID.into(),
             frame_id,
             loop_line: 8,
         },
@@ -273,6 +286,7 @@ fn investigation_4_data_processing_bug() {
     let source = get_source::run(
         &db,
         get_source::GetSourceInput {
+            trace_id: TID.into(),
             file_path: "data_processing.py".into(),
             line_range: Some([5, 16]),
         },
@@ -287,6 +301,7 @@ fn investigation_4_data_processing_bug() {
     let row = run_sql::run(
         &db,
         run_sql::RunSqlInput {
+            trace_id: TID.into(),
             query:
                 "SELECT value_id FROM values WHERE type_tag = 'float' AND float_value = 0.0 LIMIT 1"
                     .into(),
@@ -298,6 +313,7 @@ fn investigation_4_data_processing_bug() {
     let slice = causal_slice::run(
         &db,
         causal_slice::CausalSliceInput {
+            trace_id: TID.into(),
             value_id,
             max_depth: Some(2),
         },

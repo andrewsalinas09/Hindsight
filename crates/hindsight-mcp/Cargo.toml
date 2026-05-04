@@ -16,9 +16,10 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 duckdb = { version = "1.1", features = ["bundled"] }
+toml = "0.8"
 tracing = "0.1"
+hindsight-format = { path = "../hindsight-format" }
 hindsight-index = { path = "../hindsight-index" }
 
 [dev-dependencies]
 tempfile = "3"
-hindsight-format = { path = "../hindsight-format" }

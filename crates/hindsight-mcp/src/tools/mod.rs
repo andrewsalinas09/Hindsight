@@ -16,6 +16,8 @@ pub mod find_call;
 pub mod find_iterations;
 pub mod get_call_tree;
 pub mod get_source;
+pub mod list_traces;
 pub mod run_sql;
+pub mod trace_info;
 pub mod trace_variable;
 pub mod why_did_value_change;

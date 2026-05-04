@@ -6,6 +6,7 @@
 //! tests can drive.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use hindsight_format::{
     Argument, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, ExceptionRaised,
@@ -14,7 +15,13 @@ use hindsight_format::{
     Value,
 };
 use hindsight_index::Indexer;
-use hindsight_mcp::DbConnection;
+use hindsight_mcp::{DbConnection, TraceRegistry};
+
+/// Constant trace_id used by per-tool tests that drive `tools::foo::run`
+/// directly. The tool functions take a `&DbConnection` and don't consult
+/// the trace_id field; we still need to put *something* there to satisfy
+/// the input struct.
+pub const TID: &str = "test";
 
 pub fn metadata(start_ns: u64) -> Metadata {
     Metadata {
@@ -78,6 +85,23 @@ pub fn index_to_db(trace_bytes: &[u8]) -> (DbConnection, PathBuf) {
     Indexer::index(&trace, &db).unwrap();
     let conn = DbConnection::open(db.clone()).unwrap();
     (conn, db)
+}
+
+/// Set up a registry that points at a fresh single-trace directory
+/// containing the indexed `.hindsight`/`.duckdb` pair. Returns the
+/// registry plus the trace_id you can pass to tools.
+#[allow(dead_code)] // used by tests/tools.rs but not tests/demo_investigations.rs
+pub fn registry_for(trace_bytes: &[u8]) -> (Arc<TraceRegistry>, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "hindsight-mcp-test-dir-{}-{}",
+        std::process::id(),
+        SUFFIX_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let trace_path = dir.join("fixture.hindsight");
+    std::fs::write(&trace_path, trace_bytes).unwrap();
+    let registry = TraceRegistry::from_directory(dir).unwrap();
+    (Arc::new(registry), "fixture".to_string())
 }
 
 // ---------------------------------------------------------------------------

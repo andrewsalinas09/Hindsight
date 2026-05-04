@@ -12,6 +12,8 @@ use crate::error::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunSqlInput {
+    /// Trace to query. Use list_traces to discover available trace_ids.
+    pub trace_id: String,
     /// The SQL query to execute. Must be SELECT-only — INSERT, UPDATE,
     /// DELETE, DROP, CREATE, ALTER, ATTACH, and PRAGMA are rejected.
     pub query: String,

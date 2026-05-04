@@ -23,6 +23,7 @@ use crate::value::{ValueSummary, fetch_value_summary};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CausalSliceInput {
+    pub trace_id: String,
     pub value_id: i64,
     /// How far back to walk. Default 5.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -16,6 +16,7 @@ use crate::value::{ValueSummary, fetch_value_summaries};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExplainBranchInput {
+    pub trace_id: String,
     pub event_id: i64,
 }
 

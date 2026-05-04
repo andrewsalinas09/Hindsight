@@ -16,6 +16,7 @@ use crate::value::{ValueSummary, fetch_value_summaries, fetch_value_summary};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WhyDidValueChangeInput {
+    pub trace_id: String,
     pub name: String,
     pub frame_id: i64,
     pub around_event_id: i64,

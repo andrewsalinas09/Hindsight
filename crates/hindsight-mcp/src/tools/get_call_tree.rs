@@ -13,6 +13,7 @@ use crate::error::ToolError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GetCallTreeInput {
+    pub trace_id: String,
     pub frame_id: i64,
     /// Maximum tree depth from the root frame. Default unlimited.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -10,8 +10,15 @@ use crate::conn::DbConnection;
 use crate::error::ToolError;
 use crate::schema_descriptions::{QUERY_PATTERNS, TABLES};
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct DescribeSchemaInput {}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DescribeSchemaInput {
+    /// Optional. If provided, the column types come from that trace's
+    /// indexed database; otherwise the server picks any available trace.
+    /// The schema is the same across all Hindsight traces, so this is
+    /// primarily useful as a smoke test that the trace is accessible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ColumnInfo {
@@ -42,43 +49,48 @@ pub struct DescribeSchemaOutput {
     pub common_query_patterns: Vec<QueryPatternInfo>,
 }
 
-pub fn run(db: &DbConnection) -> Result<DescribeSchemaOutput, ToolError> {
-    let conn = db.lock();
-    let mut stmt = conn
-        .prepare(
-            "SELECT table_name, column_name, data_type FROM information_schema.columns \
-             WHERE table_schema = 'main' ORDER BY table_name, ordinal_position",
-        )
-        .map_err(|e| ToolError::new("database_error", e.to_string()))?;
+/// `db` is optional — the prose schema descriptions are static, so a
+/// trace need not be available. When `db` is `Some`, column types are
+/// pulled from the live information_schema; when `None`, the columns
+/// list is built from the static descriptions only.
+pub fn run(db: Option<&DbConnection>) -> Result<DescribeSchemaOutput, ToolError> {
     let mut by_table: std::collections::BTreeMap<String, Vec<(String, String)>> =
         Default::default();
-    let mut rows = stmt
-        .query([])
-        .map_err(|e| ToolError::new("database_error", e.to_string()))?;
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| ToolError::new("database_error", e.to_string()))?
-    {
-        let table: String = row
-            .get(0)
+    if let Some(db) = db {
+        let conn = db.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_name, column_name, data_type FROM information_schema.columns \
+                 WHERE table_schema = 'main' ORDER BY table_name, ordinal_position",
+            )
             .map_err(|e| ToolError::new("database_error", e.to_string()))?;
-        let col: String = row
-            .get(1)
+        let mut rows = stmt
+            .query([])
             .map_err(|e| ToolError::new("database_error", e.to_string()))?;
-        let ty: String = row
-            .get(2)
-            .map_err(|e| ToolError::new("database_error", e.to_string()))?;
-        by_table.entry(table).or_default().push((col, ty));
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| ToolError::new("database_error", e.to_string()))?
+        {
+            let table: String = row
+                .get(0)
+                .map_err(|e| ToolError::new("database_error", e.to_string()))?;
+            let col: String = row
+                .get(1)
+                .map_err(|e| ToolError::new("database_error", e.to_string()))?;
+            let ty: String = row
+                .get(2)
+                .map_err(|e| ToolError::new("database_error", e.to_string()))?;
+            by_table.entry(table).or_default().push((col, ty));
+        }
     }
-    drop(rows);
-    drop(stmt);
-    drop(conn);
 
     let mut tables: Vec<TableInfo> = Vec::new();
     // Iterate in our documented order so the LLM sees important tables first.
     for desc in TABLES {
         let cols_in_db = by_table.remove(desc.name);
         let columns = match cols_in_db {
+            // Live DB: type comes from information_schema, description
+            // from our static map.
             Some(cols) => cols
                 .into_iter()
                 .map(|(name, ty)| ColumnInfo {
@@ -91,7 +103,21 @@ pub fn run(db: &DbConnection) -> Result<DescribeSchemaOutput, ToolError> {
                     col_type: ty,
                 })
                 .collect(),
-            None => Vec::new(),
+            // No DB available: fall back to the static descriptions.
+            // Type is left empty since we don't have it without querying.
+            None => desc
+                .columns
+                .iter()
+                .map(|(name, description)| ColumnInfo {
+                    name: (*name).to_string(),
+                    col_type: String::new(),
+                    description: if description.is_empty() {
+                        None
+                    } else {
+                        Some((*description).to_string())
+                    },
+                })
+                .collect(),
         };
         tables.push(TableInfo {
             name: desc.name.to_string(),

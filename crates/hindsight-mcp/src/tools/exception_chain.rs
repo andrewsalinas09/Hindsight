@@ -13,6 +13,7 @@ use crate::value::fetch_value_summary;
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExceptionChainInput {
+    pub trace_id: String,
     pub event_id: i64,
 }
 
