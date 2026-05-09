@@ -67,10 +67,20 @@ pub fn write_value_data<W: Write>(w: &mut W, value: &Value) -> io::Result<()> {
             w.write_all(&[kind.as_u8()])?;
             w.write_all(&[confidence.as_u8()])?;
             write_uvarint(w, *aliased_value_id)?;
-            if let AliasKind::Grown { new_elements } = kind {
-                write_uvarint(w, new_elements.len() as u64)?;
-                for id in new_elements {
-                    write_uvarint(w, *id)?;
+            match kind {
+                AliasKind::Equivalent => {}
+                AliasKind::Grown { new_elements } => {
+                    write_uvarint(w, new_elements.len() as u64)?;
+                    for id in new_elements {
+                        write_uvarint(w, *id)?;
+                    }
+                }
+                AliasKind::Patch {
+                    position,
+                    new_element_value_id,
+                } => {
+                    write_uvarint(w, *position)?;
+                    write_uvarint(w, *new_element_value_id)?;
                 }
             }
         }

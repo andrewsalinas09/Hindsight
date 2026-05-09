@@ -411,6 +411,36 @@ impl PyTraceWriter {
         .map_err(format_err)
     }
 
+    /// Emit a "patch" alias: a fresh value_id representing the aliased
+    /// container with one element replaced at the given position.
+    ///
+    /// For lists/tuples/sets, ``position`` is the integer index. For
+    /// dicts, ``position`` is the pair index — the value half is
+    /// replaced by ``new_element_value_id``, the key half stays.
+    ///
+    /// O(1). The recorder uses this for in-place index assignment
+    /// (``lst[i] = x``, ``dict[k] = v``) when the static analyzer
+    /// pinned the (container, key) at a STORE_SUBSCR offset.
+    fn intern_value_alias_patch(
+        &mut self,
+        aliased_value_id: u64,
+        position: u64,
+        new_element_value_id: u64,
+        confidence_str: &str,
+    ) -> PyResult<u64> {
+        let confidence = parse_confidence(confidence_str)?;
+        let w = self.inner_mut()?;
+        w.intern_value_alias(
+            AliasKind::Patch {
+                position,
+                new_element_value_id,
+            },
+            aliased_value_id,
+            confidence,
+        )
+        .map_err(format_err)
+    }
+
     /// Intern a Python container without re-walking it: takes a list of
     /// pre-interned child value_ids and emits an inline list/set/dict.
     ///
@@ -1026,6 +1056,14 @@ fn decode_value_entry(
                 hindsight_format::AliasKind::Grown { new_elements } => {
                     d.set_item("alias_kind", "grown")?;
                     d.set_item("new_elements", new_elements.clone())?;
+                }
+                hindsight_format::AliasKind::Patch {
+                    position,
+                    new_element_value_id,
+                } => {
+                    d.set_item("alias_kind", "patch")?;
+                    d.set_item("position", *position)?;
+                    d.set_item("new_element_value_id", *new_element_value_id)?;
                 }
             }
             d.into_any().unbind()

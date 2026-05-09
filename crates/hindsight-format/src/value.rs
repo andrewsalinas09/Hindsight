@@ -157,9 +157,11 @@ pub fn derive_confidence(hash_kind: HashKind, tag: ValueTag) -> Confidence {
     }
 }
 
-/// Kind of an alias entry. Distinguishes "fully-equivalent re-snapshot" from
-/// "previous container plus new tail elements" — the latter is the
-/// append-in-a-loop fast path.
+/// Kind of an alias entry. Distinguishes:
+/// - "fully equivalent re-snapshot"
+/// - "previous container plus new tail elements" — append-in-a-loop fast path
+/// - "previous container with one element replaced at a known position" —
+///   the in-place index-assignment fast path (`lst[i] = x`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AliasKind {
     /// Same content as the aliased value.
@@ -172,6 +174,23 @@ pub enum AliasKind {
         /// existing elements. For dicts this is interpreted as `(k, v)` pairs.
         new_elements: Vec<ValueId>,
     },
+    /// Aliased container with a single element replaced at a known
+    /// position. This is the wire-format optimization for `lst[i] = x` —
+    /// instead of re-snapshotting the whole list when one slot changes,
+    /// the recorder emits an alias that says "same as source value_id N
+    /// except position K is now value_id V."
+    ///
+    /// For lists/tuples/sets, ``position`` is the integer index. For
+    /// dicts, ``position`` is the integer index *into the source's
+    /// dict-pair list* — the indexer applies the patch by replacing
+    /// the value half of pair K with ``new_element_value_id`` (the key
+    /// half is left untouched, since `dict[k] = v` doesn't change `k`).
+    Patch {
+        /// The element index (or pair index, for dicts) being replaced.
+        position: u64,
+        /// The new value at that position.
+        new_element_value_id: ValueId,
+    },
 }
 
 impl AliasKind {
@@ -179,6 +198,7 @@ impl AliasKind {
         match self {
             Self::Equivalent => 0x01,
             Self::Grown { .. } => 0x02,
+            Self::Patch { .. } => 0x03,
         }
     }
 }

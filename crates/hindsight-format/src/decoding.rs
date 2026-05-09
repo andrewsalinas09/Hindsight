@@ -124,6 +124,15 @@ pub(crate) fn decode_value(tag: ValueTag, data: &[u8]) -> Result<Value> {
                     require_consumed(&sub, tag)?;
                     AliasKind::Grown { new_elements }
                 }
+                0x03 => {
+                    let position = sub.read_uvarint()?;
+                    let new_element_value_id = sub.read_uvarint()?;
+                    require_consumed(&sub, tag)?;
+                    AliasKind::Patch {
+                        position,
+                        new_element_value_id,
+                    }
+                }
                 other => return Err(FormatError::InvalidAliasKind(other)),
             };
             Value::Alias {

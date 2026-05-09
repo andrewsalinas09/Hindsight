@@ -51,6 +51,8 @@ from ._mutation_tracking import (
     METHOD_MUTATION_NAMES,
     MutationOffsets,
     install_mutation_events_for_code,
+    is_known_mutating_call,
+    is_known_readonly_call,
     scan_mutation_offsets,
 )
 
@@ -575,6 +577,7 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _on_instruction,
         _on_call,
         _mark_dirty_across_frame_caches,
+        _note_patch_across_frame_caches,
         _opname_at,
         _monitored_event_kinds,
         _resolve_mode_for_new_frame,
@@ -592,6 +595,8 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _capture_mod._safe_intern,
         _capture_mod._full_intern,
         _capture_mod._emit_grown_list_alias,
+        _capture_mod._emit_grown_dict_alias,
+        _capture_mod._apply_pending_patches,
         _capture_mod._list_prefix_unchanged_likely,
         _capture_mod._container_kind,
         _capture_mod._last_element_pyid,
@@ -599,10 +604,14 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _capture_mod.ContainerCache.remember,
         _capture_mod.ContainerCache.mark_dirty,
         _capture_mod.ContainerCache.mark_all_dirty,
+        _capture_mod.ContainerCache.note_patch,
         _capture_mod.ContainerCache.__init__,
         # _mutation_tracking module helpers.
         _mut_mod.scan_mutation_offsets,
         _mut_mod.install_mutation_events_for_code,
+        _mut_mod.is_known_mutating_call,
+        _mut_mod.is_known_readonly_call,
+        _mut_mod._qualified_callable_name,
         _RecorderState.__init__,
         _RecorderState.timestamp_delta_ns,
         _RecorderState.alloc_frame_id,
@@ -1265,7 +1274,22 @@ def _on_instruction(code: Any, instruction_offset: int) -> Any:
         if local_name is not None:
             target = frame.f_locals.get(local_name)
             if target is not None:
-                _mark_dirty_across_frame_caches(state, id(target))
+                target_id = id(target)
+                # Patch alias path: if the key local is statically known
+                # too AND the key resolves to a non-negative int that's
+                # in-range for at least one cached entry of this id, note
+                # a pending Patch instead of marking dirty. This produces
+                # an O(1) wire-format delta (Patch alias) per index
+                # assignment instead of a full re-walk.
+                key_local = scan.key_local_at(instruction_offset)
+                if key_local is not None:
+                    key_value = frame.f_locals.get(key_local)
+                    if isinstance(key_value, int) and not isinstance(key_value, bool):
+                        if _note_patch_across_frame_caches(
+                            state, target_id, key_value
+                        ):
+                            return None
+                _mark_dirty_across_frame_caches(state, target_id)
             return None
         # Couldn't statically pin the container. Coarse fallback: mark
         # every cached container in the firing frame dirty. Producing
@@ -1286,27 +1310,60 @@ def _on_call(
     arg0: Any,
 ) -> Any:
     """CALL callback. Fires before each Python-level call; ``arg0`` is
-    the first argument (the receiver for bound method calls).
+    the first argument (the receiver for bound method calls, or the
+    first positional for module functions).
 
-    Strategy: if ``callable_obj`` is a bound method whose name is in
-    ``METHOD_MUTATION_NAMES`` and ``arg0`` is a tracked container, mark
-    that container dirty. False positives (e.g., ``lst.copy()`` would
-    not actually mutate but its name isn't in the list, so this is
-    fine) cost only an unnecessary re-walk; false negatives are not
-    possible for the listed methods.
+    Decision tree, ordered cheapest to most defensive:
+
+    1. ``callable_obj`` is a known mutating method (``.append``,
+       ``.sort``, etc.) and ``arg0`` is a tracked container → mark dirty.
+    2. ``callable_obj`` is a known mutating module function
+       (``heapq.heappush``, ``random.shuffle``, etc.) → mark arg0 dirty.
+    3. ``callable_obj`` is a known *readonly* function (``len``,
+       ``sorted``, etc.) → no-op.
+    4. ``arg0`` is a tracked container in any cache and the callable
+       isn't classified → conservatively mark dirty. False positive
+       cost is one unnecessary re-walk on the next capture; false
+       negative cost is "the trace silently lies about a mutation."
+       The latter is unacceptable, so the former is the right trade.
+
+    The conservative fallback in step 4 closes the heap-style bypass:
+    even if a third-party library passes a tracked container to a
+    function we don't know about, we err on the side of "this might
+    have mutated; reconcile on next capture."
     """
     global _in_callback
     state = _state
     if state is None or _in_callback or code in state.skip_codes:
         return None
-    method_name = getattr(callable_obj, "__name__", None)
-    if method_name not in METHOD_MUTATION_NAMES:
-        return None
     if arg0 is None:
         return None
+
     _in_callback = True
     try:
-        _mark_dirty_across_frame_caches(state, id(arg0))
+        # Step 1: known method mutator on receiver.
+        method_name = getattr(callable_obj, "__name__", None)
+        if method_name in METHOD_MUTATION_NAMES:
+            _mark_dirty_across_frame_caches(state, id(arg0))
+            return None
+
+        # Step 2: known module-function mutator (heapq.heappush etc.).
+        if is_known_mutating_call(callable_obj):
+            _mark_dirty_across_frame_caches(state, id(arg0))
+            return None
+
+        # Step 3: known readonly — no dirty mark needed.
+        if is_known_readonly_call(callable_obj):
+            return None
+
+        # Step 4: conservative fallback. If arg0 is a tracked container
+        # in *any* frame's cache, mark it dirty. We don't know what
+        # this function does; assume the worst.
+        py_id = id(arg0)
+        for cache in state.container_cache_by_pyframe.values():
+            if cache.lookup(py_id) is not None:
+                _mark_dirty_across_frame_caches(state, py_id)
+                break
     finally:
         _in_callback = False
     return None
@@ -1323,6 +1380,28 @@ def _mark_dirty_across_frame_caches(state: _RecorderState, py_id: int) -> None:
     """
     for cache in state.container_cache_by_pyframe.values():
         cache.mark_dirty(py_id)
+
+
+def _note_patch_across_frame_caches(
+    state: _RecorderState, py_id: int, position: int
+) -> bool:
+    """Record a pending Patch for a STORE_SUBSCR with statically-known
+    container and key. Returns True iff *every* cache that holds this
+    container accepted the patch (i.e., it's a list and the position is
+    in range). If any cache rejects (wrong kind, out-of-range), the
+    caller should fall back to ``mark_dirty`` so we don't leave a stale
+    cache with no patch and no dirty mark.
+    """
+    saw_any = False
+    for cache in state.container_cache_by_pyframe.values():
+        if cache.lookup(py_id) is None:
+            continue
+        saw_any = True
+        if not cache.note_patch(py_id, position):
+            # Mixed: this cache holds the container but can't take the
+            # patch. Caller will mark dirty for safety.
+            return False
+    return saw_any
 
 
 def _opname_at(state: _RecorderState, code: Any, offset: int) -> str:

@@ -464,10 +464,21 @@ impl TraceWriter {
         if (aliased_value_id as usize) >= self.values.len() {
             return Err(FormatError::UnknownValueId(aliased_value_id));
         }
-        if let AliasKind::Grown { new_elements } = &kind {
-            for id in new_elements {
-                if (*id as usize) >= self.values.len() {
-                    return Err(FormatError::UnknownValueId(*id));
+        match &kind {
+            AliasKind::Equivalent => {}
+            AliasKind::Grown { new_elements } => {
+                for id in new_elements {
+                    if (*id as usize) >= self.values.len() {
+                        return Err(FormatError::UnknownValueId(*id));
+                    }
+                }
+            }
+            AliasKind::Patch {
+                new_element_value_id,
+                ..
+            } => {
+                if (*new_element_value_id as usize) >= self.values.len() {
+                    return Err(FormatError::UnknownValueId(*new_element_value_id));
                 }
             }
         }

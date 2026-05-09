@@ -121,55 +121,59 @@ def test_sort_method_marks_dirty(trace_path: Path):
     assert dirty, "lst.sort() should produce dirty_reconciled aliases"
 
 
-def test_dict_update_marks_dirty(trace_path: Path):
-    """`d[k] = v` is STORE_SUBSCR; `d.update(...)` is a CALL on a
-    known-mutating method. Both should mark dirty."""
+def test_dict_update_emits_mutation_tracked_aliases(trace_path: Path):
+    """`d[k] = v` is STORE_SUBSCR (with statically-pinned container+key);
+    `d.update(...)` is a CALL on a known-mutating method. Both should be
+    observed as mutations and trigger the dict-Grown alias path
+    (mutation_tracked confidence) rather than fall through to a full
+    re-walk (dirty_reconciled)."""
 
     @hindsight.record
     def update_dict():
         d = {"a": 1}
-        d["b"] = 2  # STORE_SUBSCR
-        d.update({"c": 3})  # CALL on update
+        d["b"] = 2  # STORE_SUBSCR — observed → dirty → length grew → Grown alias.
+        d.update({"c": 3})  # CALL — observed → dirty → length grew → Grown alias.
         return d
 
     update_dict()
     trace = read_trace(trace_path)
-    dirty = _aliases_with_confidence(trace, "dirty_reconciled")
-    assert dirty, "dict mutation should produce dirty_reconciled aliases"
+    tracked = _aliases_with_confidence(trace, "mutation_tracked")
+    assert tracked, (
+        "dict mutation with growth should produce mutation_tracked Grown aliases"
+    )
 
 
 def test_non_mutating_call_does_not_force_re_walk(trace_path: Path):
-    """`len(lst)` and `lst.copy()` are not mutating. The cache should
-    stay clean and the alias path should keep emitting summary_observed
-    (or content_exact for first captures) — not dirty_reconciled."""
+    """`len(lst)` is in the module-function readonly allowlist — it does
+    not mark dirty, so the alias path stays clean. Other readonly
+    helpers (``sorted(lst)``, ``sum(lst)``) behave the same way."""
 
     @hindsight.record
     def read_only_calls():
         lst = [1, 2, 3]
         n = len(lst)
-        copy = lst.copy()
-        return n, copy
+        s = sum(lst)
+        m = max(lst)
+        return n, s, m
 
     read_only_calls()
     trace = read_trace(trace_path)
-    # If the tracker were over-eager it would flood with
-    # dirty_reconciled. We expect at most a small number (the first
-    # capture's content_exact + maybe some summary_observed aliases).
     dirty = _aliases_with_confidence(trace, "dirty_reconciled")
-    # `lst.copy()` is not in METHOD_MUTATION_NAMES so it shouldn't
-    # mark dirty. (`len()` doesn't dispatch as a method call on lst.)
+    # len/sum/max are in MODULE_FUNCTION_READONLY → no dirty mark.
     assert len(dirty) == 0, (
-        f"non-mutating calls should not produce dirty_reconciled, got {len(dirty)}"
+        f"readonly-classified calls should not produce dirty_reconciled, "
+        f"got {len(dirty)}"
     )
 
 
-def test_in_place_index_assignment_in_loop_each_capture_dirty_reconciled(
+def test_in_place_index_assignment_in_loop_emits_patch_aliases(
     trace_path: Path,
 ):
     """The motivating correctness regression case: `for i: lst[i] = ...`
-    in a loop. Without the mutation tracker, every iteration would emit
-    a summary_observed alias even though the contents changed. With the
-    tracker, every iteration's capture sees the dirty flag and re-walks."""
+    in a loop. With v0.4's Patch alias path, each STORE_SUBSCR with
+    statically-pinned container *and* key emits a Patch alias
+    (mutation_tracked confidence) at the next capture — O(1) wire
+    delta, not a full re-walk."""
 
     @hindsight.record
     def squarish():
@@ -180,14 +184,16 @@ def test_in_place_index_assignment_in_loop_each_capture_dirty_reconciled(
 
     squarish()
     trace = read_trace(trace_path)
-    dirty = _aliases_with_confidence(trace, "dirty_reconciled")
+    tracked = _aliases_with_confidence(trace, "mutation_tracked")
     summary = _aliases_with_confidence(trace, "summary_observed")
-    # The 5-iteration loop should produce multiple dirty_reconciled
-    # aliases as each STORE_SUBSCR fires and the next LINE event walks
-    # the list.
-    assert len(dirty) >= 3, (
-        f"in-place index loop should produce many dirty_reconciled aliases, "
-        f"got {len(dirty)} (summary_observed: {len(summary)})"
+    dirty = _aliases_with_confidence(trace, "dirty_reconciled")
+    # 5 iterations × 1 STORE_SUBSCR = 5 Patch aliases (chained off the
+    # previous capture). The exact count depends on per-LINE capture
+    # ordering, but ≥3 is a safe lower bound that catches regressions.
+    assert len(tracked) >= 3, (
+        f"in-place index loop should produce mutation_tracked Patch "
+        f"aliases, got {len(tracked)} "
+        f"(dirty_reconciled: {len(dirty)}, summary_observed: {len(summary)})"
     )
 
 

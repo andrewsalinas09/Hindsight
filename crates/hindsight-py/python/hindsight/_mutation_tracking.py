@@ -79,8 +79,13 @@ from typing import Any
 __all__ = [
     "INSTRUCTION_MUTATION_OPCODES",
     "METHOD_MUTATION_NAMES",
+    "MODULE_FUNCTION_MUTATORS",
+    "MODULE_FUNCTION_READONLY",
+    "is_known_readonly_call",
+    "is_known_mutating_call",
     "scan_mutation_offsets",
     "MutationOffsets",
+    "install_mutation_events_for_code",
 ]
 
 
@@ -134,20 +139,29 @@ METHOD_MUTATION_NAMES: frozenset[str] = frozenset(
 
 
 class MutationOffsets:
-    """Static analysis result for one code object: which bytecode offsets
-    are mutation opcodes, and (where statically determinable) which local
-    variable holds the container being mutated.
+    """Static analysis result for one code object.
+
+    For each STORE_SUBSCR / DELETE_SUBSCR / etc. offset, records:
+    - which local variable holds the container being mutated
+      (``container_locals``)
+    - which local variable holds the subscript key (``key_locals``)
+
+    Both are best-effort: if the bytecode pattern doesn't fit the simple
+    ``LOAD_FAST value; LOAD_FAST container; LOAD_FAST key; STORE_SUBSCR``
+    shape, the corresponding entry is None and the runtime falls back
+    to coarser handling (mark dirty, re-walk on next capture).
 
     Built once per code object at PY_START via ``scan_mutation_offsets``,
     cached on ``_RecorderState.mutation_offsets_by_code``.
     """
 
-    __slots__ = ("offsets", "container_locals")
+    __slots__ = ("offsets", "container_locals", "key_locals")
 
     def __init__(
         self,
         offsets: set[int],
         container_locals: dict[int, str | None],
+        key_locals: dict[int, str | None],
     ) -> None:
         # Set of bytecode offsets at which the recorder needs INSTRUCTION
         # events. Other offsets get DISABLE on first fire.
@@ -156,12 +170,21 @@ class MutationOffsets:
         # mutated, or None if the static scanner couldn't pin it down
         # (e.g., the container is the result of an expression).
         self.container_locals = container_locals
+        # Map from offset → local name that holds the subscript key,
+        # or None. When both this and the container are known at a
+        # STORE_SUBSCR offset, the recorder can emit a Patch alias
+        # (O(1) wire-format delta) instead of marking dirty for a full
+        # re-walk.
+        self.key_locals = key_locals
 
     def is_mutation_offset(self, offset: int) -> bool:
         return offset in self.offsets
 
     def container_local_at(self, offset: int) -> str | None:
         return self.container_locals.get(offset)
+
+    def key_local_at(self, offset: int) -> str | None:
+        return self.key_locals.get(offset)
 
 
 def scan_mutation_offsets(code: Any) -> MutationOffsets:
@@ -194,75 +217,103 @@ def scan_mutation_offsets(code: Any) -> MutationOffsets:
     """
     offsets: set[int] = set()
     container_locals: dict[int, str | None] = {}
+    key_locals: dict[int, str | None] = {}
 
     instructions = list(dis.get_instructions(code))
     for i, inst in enumerate(instructions):
         if inst.opname not in INSTRUCTION_MUTATION_OPCODES:
             continue
         offsets.add(inst.offset)
-        # Try to determine the container local for STORE/DELETE_SUBSCR
-        # by walking backward through preceding LOAD instructions.
         if inst.opname in ("STORE_SUBSCR", "DELETE_SUBSCR"):
-            container_locals[inst.offset] = _container_local_for_subscr(
+            container_local, key_local = _subscr_locals(
                 instructions, i, inst.opname
             )
+            container_locals[inst.offset] = container_local
+            key_locals[inst.offset] = key_local
         else:
             # Comprehension and bulk-update opcodes: don't try to pin a
             # local. Coarse reconciliation is the v0.3 fallback.
             container_locals[inst.offset] = None
-    return MutationOffsets(offsets=offsets, container_locals=container_locals)
+            key_locals[inst.offset] = None
+    return MutationOffsets(
+        offsets=offsets,
+        container_locals=container_locals,
+        key_locals=key_locals,
+    )
 
 
-def _container_local_for_subscr(
+_LOAD_OPCODES = frozenset(
+    {
+        "LOAD_FAST",
+        "LOAD_FAST_BORROW",
+        "LOAD_FAST_CHECK",
+        "LOAD_DEREF",
+        "LOAD_NAME",
+        "LOAD_GLOBAL",
+        "LOAD_CONST",
+        "LOAD_ATTR",
+    }
+)
+
+_LOAD_FAST_OPCODES = frozenset(
+    {
+        "LOAD_FAST",
+        "LOAD_FAST_BORROW",
+        "LOAD_FAST_CHECK",
+    }
+)
+
+
+def _subscr_locals(
     instructions: list[Any],
     subscr_index: int,
     opname: str,
-) -> str | None:
-    """For ``STORE_SUBSCR`` at ``instructions[subscr_index]``, find the
-    LOAD_FAST that produced the container operand and return its argval
-    (the local name).
+) -> tuple[str | None, str | None]:
+    """For STORE_SUBSCR / DELETE_SUBSCR at ``instructions[subscr_index]``,
+    walk backward and try to pin BOTH the container local and the key
+    local. Returns ``(container_local, key_local)``; either may be None
+    if the bytecode pattern doesn't fit.
 
     Stack shape at STORE_SUBSCR: TOS = key, TOS-1 = container, TOS-2 = value.
     Stack shape at DELETE_SUBSCR: TOS = key, TOS-1 = container.
 
-    Walking backward: skip the key-producing instructions (one
-    instruction in the simple case), then skip the container-producing
-    instructions, then look at the value-producing instructions.
-    Actually that's the wrong order — we want the *container*, which is
-    the second pushed. So skip one push (the key), then the next push is
-    the container.
+    Pattern that compiles for the simple case ``lst[i] = x``::
 
-    For the simple ``LOAD_FAST x; LOAD_FAST lst; LOAD_FAST i;
-    STORE_SUBSCR`` pattern, this picks ``lst``.
+        LOAD_FAST x       # value (absent for DELETE)
+        LOAD_FAST lst     # container
+        LOAD_FAST i       # key
+        STORE_SUBSCR
+
+    The walk: instruction[i-1] is the key load, instruction[i-2] is the
+    container load. If either is a simple LOAD_FAST*, we record its
+    argval. Anything else (call result, attribute access of an
+    expression, BINARY_OP) → None for that slot.
     """
-    # Walk backward from the STORE_SUBSCR. Skip the key (1 instruction
-    # in the simple case), then return the next LOAD_FAST's argval.
-    skipped_key = False
-    for j in range(subscr_index - 1, max(-1, subscr_index - 8), -1):
-        inst = instructions[j]
-        # Only consider load-shaped opcodes; anything else (like a CALL
-        # or BINARY_OP that produces the key) means we can't statically
-        # walk this — bail.
-        if inst.opname not in (
-            "LOAD_FAST",
-            "LOAD_FAST_BORROW",
-            "LOAD_FAST_CHECK",
-            "LOAD_DEREF",
-            "LOAD_NAME",
-            "LOAD_GLOBAL",
-            "LOAD_CONST",
-            "LOAD_ATTR",
-        ):
-            return None
-        if not skipped_key:
-            skipped_key = True
-            continue
-        # This should be the container's load.
-        if inst.opname.startswith("LOAD_FAST"):
-            return inst.argval
-        # Not a simple local — punt.
-        return None
-    return None
+    container_local: str | None = None
+    key_local: str | None = None
+
+    # instruction[subscr_index - 1] should be the key push.
+    if subscr_index - 1 >= 0:
+        key_inst = instructions[subscr_index - 1]
+        if key_inst.opname in _LOAD_FAST_OPCODES:
+            key_local = key_inst.argval
+        # If it's a non-load opcode entirely, the simple shape doesn't
+        # apply — but we still try the container slot below in case the
+        # key was a small constant (rare; skip for now).
+
+    # instruction[subscr_index - 2] should be the container push.
+    if subscr_index - 2 >= 0:
+        container_inst = instructions[subscr_index - 2]
+        if container_inst.opname in _LOAD_FAST_OPCODES:
+            container_local = container_inst.argval
+        elif container_inst.opname not in _LOAD_OPCODES:
+            # Non-load instruction in the container slot — pattern broken;
+            # leave both None to be safe (the key we found above was
+            # speculative since the stack shape doesn't match).
+            container_local = None
+            key_local = None
+
+    return container_local, key_local
 
 
 def install_mutation_events_for_code(
@@ -294,3 +345,142 @@ def install_mutation_events_for_code(
         # support local events. Skip silently — those frames just don't
         # get the upgrade from summary_observed to mutation_tracked.
         pass
+
+
+# ---------------------------------------------------------------------------
+# Module-function call classification
+# ---------------------------------------------------------------------------
+#
+# Method-call mutation detection (``METHOD_MUTATION_NAMES``) only catches
+# methods dispatched on the receiver itself: ``lst.append(x)``,
+# ``dict.update({})``. It does *not* catch the heapq pattern, where the
+# container is passed as the *first argument* to a module-level function:
+# ``heapq.heappush(lst, x)``. The CALL event fires with ``arg0 = lst`` but
+# ``callable_obj.__name__ == "heappush"`` — not in our method allowlist.
+#
+# Without intervention, heapq.heappush would silently bypass the mutation
+# tracker. The trace would report the heap as unchanged across operations
+# that demonstrably mutated it. That's the kind of failure we cannot ship.
+#
+# Two layers of defense, in order of preference:
+#
+# 1. Explicit module-function allowlist: known mutators (heappush, shuffle,
+#    insort) and known readonly (sorted, reversed, len) get classified
+#    correctly with no overhead.
+# 2. Fallback: any unknown function called with a tracked container as
+#    arg0 is conservatively treated as potentially mutating — the
+#    container is marked dirty. False positives cause unnecessary
+#    re-walks; false negatives cannot occur.
+
+# Functions that mutate their first argument. Each entry is (callable
+# qualified name) — we resolve by inspecting ``callable_obj.__module__``
+# and ``__qualname__``. Conservative: only listed when documented to mutate.
+MODULE_FUNCTION_MUTATORS: frozenset[str] = frozenset(
+    {
+        # heapq — the entire push/pop API mutates the heap argument.
+        "heapq.heappush",
+        "heapq.heappop",
+        "heapq.heapify",
+        "heapq.heappushpop",
+        "heapq.heapreplace",
+        # random.shuffle — in-place shuffle.
+        "random.shuffle",
+        # bisect.insort — keeps a sorted list sorted by inserting in place.
+        "bisect.insort",
+        "bisect.insort_left",
+        "bisect.insort_right",
+    }
+)
+
+
+# Functions guaranteed to *not* mutate their first argument. Anything not
+# in this set or the mutators set is treated as potentially mutating
+# (conservative dirty-mark on next capture).
+MODULE_FUNCTION_READONLY: frozenset[str] = frozenset(
+    {
+        # builtins
+        "builtins.len",
+        "builtins.sum",
+        "builtins.min",
+        "builtins.max",
+        "builtins.any",
+        "builtins.all",
+        "builtins.sorted",
+        "builtins.reversed",
+        "builtins.list",
+        "builtins.tuple",
+        "builtins.set",
+        "builtins.frozenset",
+        "builtins.dict",
+        "builtins.iter",
+        "builtins.next",
+        "builtins.print",
+        "builtins.repr",
+        "builtins.str",
+        "builtins.hash",
+        "builtins.id",
+        "builtins.type",
+        "builtins.isinstance",
+        "builtins.issubclass",
+        "builtins.callable",
+        "builtins.getattr",
+        "builtins.hasattr",
+        "builtins.enumerate",
+        "builtins.zip",
+        "builtins.map",
+        "builtins.filter",
+        "builtins.range",
+        # heapq readonly
+        "heapq.nsmallest",
+        "heapq.nlargest",
+        "heapq.merge",
+        # bisect readonly
+        "bisect.bisect",
+        "bisect.bisect_left",
+        "bisect.bisect_right",
+        # collections / itertools constructors that don't mutate inputs
+        "collections.Counter",
+        "collections.OrderedDict",
+        "collections.defaultdict",
+        # operator helpers
+        "operator.itemgetter",
+        "operator.attrgetter",
+        "operator.methodcaller",
+    }
+)
+
+
+def _qualified_callable_name(callable_obj: Any) -> str | None:
+    """Return ``"<module>.<qualname>"`` for ``callable_obj``, or None if
+    the callable doesn't have stable identification (lambdas, partials,
+    etc.). Used to classify CALL events."""
+    if callable_obj is None:
+        return None
+    module = getattr(callable_obj, "__module__", None)
+    qualname = getattr(callable_obj, "__qualname__", None)
+    if not module or not qualname:
+        # Bound methods often have these via __func__. Try one level deeper.
+        func = getattr(callable_obj, "__func__", None)
+        if func is not None:
+            module = getattr(func, "__module__", None) or module
+            qualname = getattr(func, "__qualname__", None) or qualname
+    if not module or not qualname:
+        return None
+    return f"{module}.{qualname}"
+
+
+def is_known_mutating_call(callable_obj: Any) -> bool:
+    """True iff ``callable_obj`` is a module-level function known to
+    mutate its first argument. Used by the CALL handler to mark dirty
+    on heapq.heappush(heap, x) and similar patterns where the container
+    is passed as arg0 rather than dispatched as a method."""
+    name = _qualified_callable_name(callable_obj)
+    return name is not None and name in MODULE_FUNCTION_MUTATORS
+
+
+def is_known_readonly_call(callable_obj: Any) -> bool:
+    """True iff ``callable_obj`` is a module-level function known *not*
+    to mutate its first argument. Used to suppress conservative
+    dirty-marking for cheap operations like ``len(lst)``."""
+    name = _qualified_callable_name(callable_obj)
+    return name is not None and name in MODULE_FUNCTION_READONLY

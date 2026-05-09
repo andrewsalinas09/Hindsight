@@ -770,10 +770,11 @@ An alias entry references a previously-emitted value. It exists so the recorder 
 ```
 
 Fields:
-- **Alias kind**: 1 byte. `0x01` = `Equivalent` (this value has the same content as the aliased one). `0x02` = `Grown` (this value is the aliased one with new tail elements appended).
+- **Alias kind**: 1 byte. `0x01` = `Equivalent` (same content as aliased). `0x02` = `Grown` (aliased + new tail elements). `0x03` = `Patch` (aliased with one element replaced at a known position).
 - **Confidence**: 1 byte. See "Confidence semantics" below. The recorder records *how it knows* the alias is correct, so downstream tools (and the LLM) can caveat appropriately.
 - **Aliased value ID**: varint. The prior `value_id` this alias points at. Must be less than this entry's own `value_id` (no forward refs, same constraint as containers).
 - **Grown tail** (only when alias kind = `Grown`): a varint count followed by that many `value_id` varints. These are the new elements appended after the aliased container's existing elements. For ordered containers (lists, tuples) the order is "aliased elements then tail." For dicts (which can also grow), the tail is a flat list of `(key_id, value_id)` pairs encoded as alternating varints, count being the number of pairs.
+- **Patch payload** (only when alias kind = `Patch`): two varints: `position` (the element index in the source's element list, or for dicts the pair index) followed by `new_element_value_id` (the replacement value). For lists/tuples/sets the source element at `position` is replaced. For dicts the *value half* of the pair at `position` is replaced (the key half is unchanged, since `dict[k] = v` doesn't change `k`). Position out of range for the source's actual length is a writer bug and surfaces as a structural error.
 
 The hash field on an alias entry is set to all zeros and `hash_kind` is `Alias` (`0x04`). Aliases are not deduplicated — every alias produces a fresh `value_id`.
 

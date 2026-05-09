@@ -41,7 +41,7 @@ import os
 # Pin a stable trace name so the MCP server can address it predictably.
 # Comment this line out (or unset ``HINDSIGHT_OUTPUT_PATH``) to land in
 # the default traces directory ``~/.hindsight/traces/`` instead.
-# os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "merge_sort.hindsight")
+os.environ.setdefault("HINDSIGHT_OUTPUT_PATH", "merge_sort.hindsight")
 
 import hindsight
 

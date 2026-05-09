@@ -194,20 +194,30 @@ def test_length_shrunk_falls_back_to_full_walk(tmp_path):
     )
 
 
-def test_dict_same_length_reuses_value_id_growth_does_not(tmp_path):
+def test_dict_same_length_reuses_value_id_growth_emits_grown_alias(tmp_path):
     w = fresh_writer()
     cache = _capture.ContainerCache()
     d = {"a": 1, "b": 2}
     first = _capture.smart_intern_value(w, cache, d)
     same_len = _capture.smart_intern_value(w, cache, d)  # No change → reuse.
     d["c"] = 3
-    grown = _capture.smart_intern_value(w, cache, d)  # Length grew → re-walk.
+    grown = _capture.smart_intern_value(w, cache, d)  # Length grew → Grown alias.
 
     assert same_len == first, "clean same-length re-capture reuses cached value_id"
+    assert grown != first, "growth produces a new value_id"
 
     bytes_ = finalize(w)
     trace = read_trace(_save(bytes_, tmp_path))
-    assert trace["values"][grown]["tag"] == 0x08, "grown dict re-walks (no dict-grown alias)"
+    decoded = trace["values"][grown]["decoded"]
+    # v0.4: dict growth (without an observed mutation event) emits a Grown
+    # alias with summary_observed confidence — only the new pairs are
+    # interned, the existing entries are referenced via the prior dict.
+    assert isinstance(decoded, dict) and decoded.get("kind") == "alias", (
+        "grown dict emits an alias, not a full re-walk"
+    )
+    assert decoded["alias_kind"] == "grown"
+    assert decoded["aliased_value_id"] == first
+    assert decoded["confidence"] == "summary_observed"
 
 
 def test_set_same_length_reuses_value_id_different_length_does_not(tmp_path):

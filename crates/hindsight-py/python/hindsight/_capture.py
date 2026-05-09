@@ -68,6 +68,14 @@ class _CacheEntry:
     ``dirty_reconciled`` confidence — the alias's freshness was
     actively re-verified by reading the live container, not just
     inferred from a fingerprint.
+
+    The ``pending_patches`` set records list positions that received a
+    STORE_SUBSCR with a statically-known container *and* key. The mutation
+    tracker fills it instead of marking dirty when both can be pinned.
+    The next capture emits one Patch alias per position (chained), reads
+    the new value live from the container, and clears the set. If
+    ``dirty`` is also set, dirty wins and patches are dropped — the
+    re-walk subsumes them.
     """
 
     __slots__ = (
@@ -77,6 +85,7 @@ class _CacheEntry:
         "kind",
         "element_ids",
         "dirty",
+        "pending_patches",
     )
 
     def __init__(
@@ -103,6 +112,10 @@ class _CacheEntry:
         self.element_ids = element_ids
         # Set by the mutation tracker. Cleared on next reconciling capture.
         self.dirty = False
+        # Set of positions (list indices) where a STORE_SUBSCR fired with
+        # statically-known container+key. Consumed by the next capture to
+        # emit Patch aliases.
+        self.pending_patches: set[int] = set()
 
 
 class ContainerCache:
@@ -138,6 +151,30 @@ class ContainerCache:
         entry = self._entries.get(py_id)
         if entry is not None:
             entry.dirty = True
+
+    def note_patch(self, py_id: int, position: int) -> bool:
+        """Called by the mutation tracker when STORE_SUBSCR fires with a
+        statically-known container *and* key. Records the position so
+        the next capture can emit a Patch alias instead of marking dirty
+        for a full re-walk.
+
+        Returns True if the cache had this container and the position
+        was recorded; False otherwise (caller should fall back to
+        ``mark_dirty``). Position must be a valid in-range index for the
+        container's kind — the caller is responsible for that check.
+        """
+        entry = self._entries.get(py_id)
+        if entry is None:
+            return False
+        # Patches only meaningful for indexable list-like containers.
+        # For dicts, mid-key value replacement is a future extension;
+        # for now fall back to dirty.
+        if entry.kind not in _LIST_KINDS:
+            return False
+        if position < 0 or position >= entry.length:
+            return False
+        entry.pending_patches.add(position)
+        return True
 
     def mark_all_dirty(self) -> None:
         """Coarse fallback: a mutation event fired but we couldn't pin
@@ -239,17 +276,34 @@ def smart_intern_value(
     prior = cache.lookup(py_id)
 
     if prior is not None and prior.kind == kind:
+        # Pending Patch aliases take precedence over the no-op fast path
+        # (we have observed mutations that need to be reflected in the
+        # trace), but dirty supersedes patches (if dirty fired the
+        # container may have moved in ways that invalidate the patches —
+        # e.g., it shrank, in which case some pending positions are now
+        # out of range). Drop patches when dirty.
+        if prior.dirty and prior.pending_patches:
+            prior.pending_patches.clear()
+        if (
+            not prior.dirty
+            and prior.pending_patches
+            and kind in _LIST_KINDS
+            and new_length == prior.length
+        ):
+            return _apply_pending_patches(
+                writer, cache, value, py_id, prior, kind, new_length, new_last
+            )
         if prior.dirty:
-            # Mutation observed. Two cheap incremental paths first:
+            # Mutation observed. Try cheap incremental paths first:
             #
             # 1. List/tuple grew at the tail (append, extend, list-comp
-            #    accumulation) — emit a Grown alias for just the new
-            #    elements with mutation_tracked confidence. O(k) in the
-            #    tail length, NOT O(N) in the container size.
-            #
-            # 2. Otherwise (length unchanged or shrunk, or non-list) —
-            #    fall back to a full re-walk and emit dirty_reconciled.
-            #    Still correct, just slower.
+            #    accumulation) — Grown alias for just the new elements,
+            #    O(k) in the tail length.
+            # 2. Dict grew (new keys inserted; CPython preserves order
+            #    so the new keys are at the end) — Grown alias with
+            #    the new k,v pairs, O(k) in the growth.
+            # 3. Otherwise (length unchanged or shrunk, or non-list/dict)
+            #    — full re-walk, emit dirty_reconciled.
             if (
                 kind in _LIST_KINDS
                 and new_length > prior.length
@@ -262,6 +316,17 @@ def smart_intern_value(
                     py_id,
                     prior,
                     kind,
+                    new_length,
+                    new_last,
+                    confidence="mutation_tracked",
+                )
+            if kind == "dict" and new_length > prior.length:
+                return _emit_grown_dict_alias(
+                    writer,
+                    cache,
+                    value,
+                    py_id,
+                    prior,
                     new_length,
                     new_last,
                     confidence="mutation_tracked",
@@ -309,6 +374,24 @@ def smart_intern_value(
             if new_length == prior.length and new_last == prior.last_element_pyid:
                 # Same fingerprint, clean cache → reuse value_id.
                 return prior.value_id
+            if new_length > prior.length:
+                # Length grew. The mutation tracker didn't fire (so we're
+                # not 100% sure the prior pairs are intact), but the
+                # fingerprint endpoint check would be wrong here too —
+                # CPython appends new keys at the end so prior.last_element
+                # gets shifted into the prefix. Just emit a Grown alias
+                # with summary_observed confidence; honest about the
+                # uncertainty.
+                return _emit_grown_dict_alias(
+                    writer,
+                    cache,
+                    value,
+                    py_id,
+                    prior,
+                    new_length,
+                    new_last,
+                    confidence="summary_observed",
+                )
 
     # Fall through: first capture of this id, container kind changed
     # (unlikely but possible if id() is reused), or fingerprint mismatch
@@ -336,6 +419,150 @@ def _list_prefix_unchanged_likely(value: Any, prior: _CacheEntry, new_length: in
         return id(value[prior.length - 1]) == prior.last_element_pyid
     except (IndexError, TypeError):
         return False
+
+
+def _apply_pending_patches(
+    writer: Any,
+    cache: ContainerCache,
+    value: Any,
+    py_id: int,
+    prior: _CacheEntry,
+    kind: str,
+    new_length: int,
+    new_last: int | None,
+) -> int | None:
+    """Emit a chain of Patch aliases — one per pending position — that
+    walks from the prior cached value_id to the current observed state.
+
+    Each Patch reads ``value[pos]`` (the *new* element after STORE_SUBSCR
+    has executed) and replaces position ``pos`` of the previous link in
+    the chain. The cache is updated to point at the final link.
+
+    If anything goes wrong (intern failure, IndexError, missing PyO3
+    method), fall back to a full re-walk under ``dirty_reconciled``
+    confidence so the trace stays correct.
+    """
+    if not hasattr(writer, "intern_value_alias_patch"):
+        # Bridge doesn't expose Patch yet — degrade gracefully.
+        prior.pending_patches.clear()
+        prior.dirty = True
+        return _full_intern(
+            writer, cache, value, py_id, kind, new_length, new_last,
+            confidence_for_full_walk="dirty_reconciled",
+        )
+
+    positions = sorted(prior.pending_patches)
+    prior.pending_patches.clear()
+
+    current_value_id = prior.value_id
+    combined = list(prior.element_ids)
+
+    for pos in positions:
+        try:
+            elem = value[pos]
+        except (IndexError, TypeError):
+            # Container shape changed under us. Bail to dirty re-walk.
+            prior.dirty = True
+            return _full_intern(
+                writer, cache, value, py_id, kind, new_length, new_last,
+                confidence_for_full_walk="dirty_reconciled",
+            )
+        new_elem_id = _safe_intern(writer, elem)
+        if new_elem_id is None:
+            return None
+        try:
+            current_value_id = writer.intern_value_alias_patch(
+                current_value_id, pos, new_elem_id, "mutation_tracked"
+            )
+        except Exception:
+            prior.dirty = True
+            return _full_intern(
+                writer, cache, value, py_id, kind, new_length, new_last,
+                confidence_for_full_walk="dirty_reconciled",
+            )
+        # Reflect the patch in the cached element list so subsequent
+        # patches chain from the correct prior state.
+        if 0 <= pos < len(combined):
+            combined[pos] = new_elem_id
+
+    cache.remember(
+        py_id,
+        _CacheEntry(
+            value_id=current_value_id,
+            length=new_length,
+            last_element_pyid=new_last,
+            kind=kind,
+            element_ids=combined,
+        ),
+    )
+    return current_value_id
+
+
+def _emit_grown_dict_alias(
+    writer: Any,
+    cache: ContainerCache,
+    value: Any,
+    py_id: int,
+    prior: _CacheEntry,
+    new_length: int,
+    new_last: int | None,
+    confidence: str = "summary_observed",
+) -> int | None:
+    """Intern only the new (key, value) pairs that were appended to a
+    dict and emit a Grown alias whose source is the prior dict + the
+    new pairs.
+
+    Relies on CPython's insertion-order guarantee (3.7+): new keys land
+    at the end of the dict's iteration order. We grab the last
+    ``new_length - prior.length`` pairs from ``value.items()`` and
+    intern just those.
+
+    The alias's wire format encodes pairs as alternating key, value
+    varints in the ``new_elements`` payload — the indexer's
+    ``resolve_alias`` already knows to reconstitute them as pairs for
+    dict-tagged sources.
+    """
+    growth = new_length - prior.length
+    if growth <= 0:
+        return _full_intern(writer, cache, value, py_id, "dict", new_length, new_last)
+
+    # Pull just the new tail entries. ``items()`` is a view; iterating
+    # is O(N) but slicing requires materializing — for typical dict
+    # growth (1-2 new keys) this is cheap.
+    try:
+        items = list(value.items())
+    except Exception:
+        return _full_intern(writer, cache, value, py_id, "dict", new_length, new_last)
+    new_pairs = items[prior.length :]
+
+    if len(new_pairs) != growth:
+        # Race-y mutation under us, or non-CPython dict that doesn't
+        # preserve order. Fall back to full re-walk.
+        return _full_intern(writer, cache, value, py_id, "dict", new_length, new_last)
+
+    new_flat: list[int] = []
+    for k, v in new_pairs:
+        kid = _safe_intern(writer, k)
+        vid = _safe_intern(writer, v)
+        if kid is None or vid is None:
+            return _full_intern(writer, cache, value, py_id, "dict", new_length, new_last)
+        new_flat.append(kid)
+        new_flat.append(vid)
+
+    value_id = writer.intern_value_alias_grown(prior.value_id, new_flat, confidence)
+    combined = list(prior.element_ids)
+    combined.extend(new_flat)
+    cache.remember(
+        py_id,
+        _CacheEntry(
+            value_id=value_id,
+            length=new_length,
+            last_element_pyid=new_last,
+            kind="dict",
+            element_ids=combined,
+        ),
+    )
+    return value_id
 
 
 def _emit_grown_list_alias(

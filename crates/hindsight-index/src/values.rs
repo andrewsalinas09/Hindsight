@@ -175,6 +175,51 @@ fn resolve_alias(
             }
             Some(ElementList::Pairs(combined))
         }
+        (
+            Some(ElementList::Sequence(prior_ids)),
+            AliasKind::Patch {
+                position,
+                new_element_value_id,
+            },
+        ) => {
+            // Replace one element in the sequence. Out-of-range
+            // patches are a writer bug — we error rather than silently
+            // truncating.
+            let pos = *position as usize;
+            if pos >= prior_ids.len() {
+                return Err(IndexError::Internal(format!(
+                    "Patch alias at value_id {self_id} position {pos} out of range \
+                     for source value_id {aliased_value_id} of length {}",
+                    prior_ids.len()
+                )));
+            }
+            let mut combined = prior_ids;
+            combined[pos] = *new_element_value_id;
+            Some(ElementList::Sequence(combined))
+        }
+        (
+            Some(ElementList::Pairs(prior_pairs)),
+            AliasKind::Patch {
+                position,
+                new_element_value_id,
+            },
+        ) => {
+            // For dicts, position is the pair index and we're patching
+            // the *value* half (key stays the same — `dict[k] = v`
+            // doesn't change `k`).
+            let pos = *position as usize;
+            if pos >= prior_pairs.len() {
+                return Err(IndexError::Internal(format!(
+                    "Patch alias at value_id {self_id} position {pos} out of range \
+                     for source dict value_id {aliased_value_id} of length {}",
+                    prior_pairs.len()
+                )));
+            }
+            let mut combined = prior_pairs;
+            let (k, _) = combined[pos];
+            combined[pos] = (k, *new_element_value_id);
+            Some(ElementList::Pairs(combined))
+        }
         // Source isn't a container — alias to a scalar or summary or another
         // alias-resolved scalar. The alias's "effective" container_length is
         // None.
@@ -182,6 +227,11 @@ fn resolve_alias(
         (None, AliasKind::Grown { .. }) => {
             return Err(IndexError::Internal(format!(
                 "Grown alias at value_id {self_id} aliases non-container value_id {aliased_value_id}"
+            )));
+        }
+        (None, AliasKind::Patch { .. }) => {
+            return Err(IndexError::Internal(format!(
+                "Patch alias at value_id {self_id} aliases non-container value_id {aliased_value_id}"
             )));
         }
     };
