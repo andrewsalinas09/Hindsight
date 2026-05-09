@@ -90,22 +90,36 @@ def test_first_capture_of_list_does_not_alias():
     assert entry["tag"] == 0x07, f"expected list, got tag {entry['tag']:#x}"
 
 
-def test_second_capture_of_unchanged_list_emits_equivalent_alias(tmp_path):
+def test_second_capture_of_unchanged_list_reuses_cached_value_id(tmp_path):
+    """When the cache is clean and the fingerprint matches (same id,
+    same length, same endpoint identity), smart_intern_value returns the
+    *cached* value_id directly — no fresh alias entry is emitted.
+
+    This matters because the recorder's `_capture_locals_into_changes`
+    runs on every LINE event. If we emitted a fresh alias on every
+    re-capture, every LINE event would record a "change" for every
+    tracked container even when nothing actually changed — generating
+    wire-format noise proportional to LINE × tracked-containers.
+
+    Returning the cached value_id lets the recorder's delta logic see
+    the same value_id as last time and correctly skip re-recording.
+    """
     w = fresh_writer()
     cache = _capture.ContainerCache()
     lst = [1, 2, 3]
     first = _capture.smart_intern_value(w, cache, lst)
     second = _capture.smart_intern_value(w, cache, lst)
-    assert first != second, "alias must produce a fresh value_id"
+    assert first == second, (
+        "clean re-capture should return the cached value_id, not emit a fresh alias"
+    )
 
+    # No alias entry should have been written.
     bytes_ = finalize(w)
     trace = read_trace(_save(bytes_, tmp_path))
-    second_entry = trace["values"][second]
-    assert second_entry["tag"] == 0x15, "second capture should be alias"
-    decoded = second_entry["decoded"]
-    assert decoded["alias_kind"] == "equivalent"
-    assert decoded["aliased_value_id"] == first
-    assert decoded["confidence"] == "summary_observed"
+    alias_entries = [v for v in trace["values"] if v["tag"] == 0x15]
+    assert len(alias_entries) == 0, (
+        f"clean re-capture should not produce alias entries, got {len(alias_entries)}"
+    )
 
 
 def test_appended_list_emits_grown_alias_with_only_new_tail(tmp_path):
@@ -134,7 +148,7 @@ def test_append_loop_emits_grown_aliases_not_quadratic_inline_lists(tmp_path):
     """The whole point of the design. Capture the same list 100 times
     while it grows by one each iteration. The value-table entries should
     be: one full list (length=0 at first capture) + one int per element +
-    99 Grown aliases. Total values = 1 list + 100 ints + 99 aliases = 200,
+    100 Grown aliases. Total values = 1 list + 100 ints + 100 aliases = 201,
     NOT 1 + 100 + sum(1..99) = ~5050 inline lists.
     """
     w = fresh_writer()
@@ -150,13 +164,15 @@ def test_append_loop_emits_grown_aliases_not_quadratic_inline_lists(tmp_path):
     list_entries = [v for v in trace["values"] if v["tag"] == 0x07]
     alias_entries = [v for v in trace["values"] if v["tag"] == 0x15]
 
-    # Exactly one inline list (the very first capture), 100 grown aliases
-    # (one per re-capture), plus 100 ints (one per appended element).
+    # Exactly one inline list (the very first capture). 100 Grown
+    # aliases — each iteration's append changes the length, so the
+    # cache miss-fingerprint path emits a fresh Grown alias.
     assert len(list_entries) == 1, (
         f"expected exactly 1 inline list (the empty first capture), got {len(list_entries)}"
     )
     assert len(alias_entries) == 100, (
-        f"expected 100 alias entries, one per re-capture, got {len(alias_entries)}"
+        f"expected 100 alias entries, one per re-capture after a length change, "
+        f"got {len(alias_entries)}"
     )
 
 
@@ -178,24 +194,23 @@ def test_length_shrunk_falls_back_to_full_walk(tmp_path):
     )
 
 
-def test_dict_same_length_aliases_growth_does_not(tmp_path):
+def test_dict_same_length_reuses_value_id_growth_does_not(tmp_path):
     w = fresh_writer()
     cache = _capture.ContainerCache()
     d = {"a": 1, "b": 2}
     first = _capture.smart_intern_value(w, cache, d)
-    same_len = _capture.smart_intern_value(w, cache, d)  # No change → alias.
+    same_len = _capture.smart_intern_value(w, cache, d)  # No change → reuse.
     d["c"] = 3
-    grown = _capture.smart_intern_value(w, cache, d)  # Length grew → re-walk (no dict-grown).
+    grown = _capture.smart_intern_value(w, cache, d)  # Length grew → re-walk.
+
+    assert same_len == first, "clean same-length re-capture reuses cached value_id"
 
     bytes_ = finalize(w)
     trace = read_trace(_save(bytes_, tmp_path))
-
-    assert trace["values"][same_len]["tag"] == 0x15, "same-length dict should alias"
-    assert trace["values"][same_len]["decoded"]["alias_kind"] == "equivalent"
     assert trace["values"][grown]["tag"] == 0x08, "grown dict re-walks (no dict-grown alias)"
 
 
-def test_set_same_length_aliases_different_length_does_not(tmp_path):
+def test_set_same_length_reuses_value_id_different_length_does_not(tmp_path):
     w = fresh_writer()
     cache = _capture.ContainerCache()
     s = {1, 2, 3}
@@ -205,7 +220,7 @@ def test_set_same_length_aliases_different_length_does_not(tmp_path):
     grown = _capture.smart_intern_value(w, cache, s)
     bytes_ = finalize(w)
     trace = read_trace(_save(bytes_, tmp_path))
-    assert trace["values"][same_len]["tag"] == 0x15
+    assert same_len == first
     assert trace["values"][grown]["tag"] == 0x09, "grown set re-walks"
 
 
@@ -285,13 +300,21 @@ def test_perf_pattern_does_not_explode_value_table(trace_path: Path):
     list_entries = [v for v in trace["values"] if v["tag"] == 0x07]
     alias_entries = [v for v in trace["values"] if v["tag"] == 0x15]
 
-    # We expect: aliases dominate the post-init capture path. The exact
-    # counts depend on how many LINE events fire (one per source line
-    # executed), but aliases should outnumber inline lists by an order
-    # of magnitude.
-    assert len(alias_entries) > len(list_entries), (
-        f"alias entries ({len(alias_entries)}) should outnumber inline list "
-        f"entries ({len(list_entries)}) — that's the whole point of the design"
+    # The whole point of the design: an append loop should NOT produce
+    # an O(N) inline list per iteration. With both summary aliasing and
+    # mutation-tracked Grown aliasing, the inline-list count should
+    # stay small (just the first capture); each subsequent iteration's
+    # capture should be a Grown alias of one tail element.
+    assert len(list_entries) <= 5, (
+        f"append loop should produce a tiny number of inline list entries "
+        f"(ideally 1 — the empty initial list), got {len(list_entries)}. "
+        f"More than this means dirty re-walks aren't being optimized into "
+        f"Grown aliases."
+    )
+    assert len(alias_entries) >= 40, (
+        f"50-iteration append loop should produce ~50 Grown aliases, "
+        f"got {len(alias_entries)}. Lower than expected suggests the "
+        f"mutation-tracking path isn't firing correctly."
     )
 
 

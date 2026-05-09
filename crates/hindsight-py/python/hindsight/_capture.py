@@ -240,10 +240,32 @@ def smart_intern_value(
 
     if prior is not None and prior.kind == kind:
         if prior.dirty:
-            # The mutation tracker observed a mutation since the last
-            # capture. Don't trust the fingerprint — re-walk fully and
-            # mark the result dirty_reconciled (the strongest confidence
-            # the recorder can offer for a container that *was* mutated).
+            # Mutation observed. Two cheap incremental paths first:
+            #
+            # 1. List/tuple grew at the tail (append, extend, list-comp
+            #    accumulation) — emit a Grown alias for just the new
+            #    elements with mutation_tracked confidence. O(k) in the
+            #    tail length, NOT O(N) in the container size.
+            #
+            # 2. Otherwise (length unchanged or shrunk, or non-list) —
+            #    fall back to a full re-walk and emit dirty_reconciled.
+            #    Still correct, just slower.
+            if (
+                kind in _LIST_KINDS
+                and new_length > prior.length
+                and _list_prefix_unchanged_likely(value, prior, new_length)
+            ):
+                return _emit_grown_list_alias(
+                    writer,
+                    cache,
+                    value,
+                    py_id,
+                    prior,
+                    kind,
+                    new_length,
+                    new_last,
+                    confidence="mutation_tracked",
+                )
             return _full_intern(
                 writer,
                 cache,
@@ -256,13 +278,17 @@ def smart_intern_value(
             )
         if kind in _LIST_KINDS:
             if new_length == prior.length and new_last == prior.last_element_pyid:
-                # Same id, same length, same endpoint identity → alias.
-                value_id = writer.intern_value_alias_equivalent(
-                    prior.value_id, "summary_observed"
-                )
-                # Cache stays the same — the underlying container's
-                # element_ids haven't changed in our model.
-                return value_id
+                # Same id, same length, same endpoint identity, cache is
+                # clean → the cached value_id is still valid. Return it
+                # directly. We deliberately do NOT emit a fresh alias
+                # entry here: every LINE event in the loop body would
+                # otherwise produce one redundant alias per tracked
+                # container, even though nothing changed semantically.
+                # The recorder's `_capture_locals_into_changes` will see
+                # the same value_id as last time and correctly skip
+                # re-recording the local — preserving the schema's
+                # "deltas only" model.
+                return prior.value_id
             if (
                 new_length > prior.length
                 and _list_prefix_unchanged_likely(value, prior, new_length)
@@ -276,16 +302,13 @@ def smart_intern_value(
             # Length shrunk, or endpoint changed — full re-walk.
         elif kind in _SET_KINDS:
             if new_length == prior.length:
-                value_id = writer.intern_value_alias_equivalent(
-                    prior.value_id, "summary_observed"
-                )
-                return value_id
+                # Same fingerprint, clean cache → reuse value_id (see
+                # the LIST_KINDS branch above for the rationale).
+                return prior.value_id
         elif kind == "dict":
             if new_length == prior.length and new_last == prior.last_element_pyid:
-                value_id = writer.intern_value_alias_equivalent(
-                    prior.value_id, "summary_observed"
-                )
-                return value_id
+                # Same fingerprint, clean cache → reuse value_id.
+                return prior.value_id
 
     # Fall through: first capture of this id, container kind changed
     # (unlikely but possible if id() is reused), or fingerprint mismatch
@@ -324,9 +347,17 @@ def _emit_grown_list_alias(
     kind: str,
     new_length: int,
     new_last: int | None,
+    confidence: str = "summary_observed",
 ) -> int | None:
     """Intern only the new tail elements and emit an alias whose source
-    is the prior container plus the tail."""
+    is the prior container plus the tail.
+
+    ``confidence`` defaults to ``summary_observed`` for the fingerprint-
+    based growth path (we *infer* it was an append from the prefix
+    check). Pass ``mutation_tracked`` when the caller has observed the
+    mutation directly (e.g., after a CALL event marked the cache
+    dirty) — at that point growth detection is no longer an inference.
+    """
     new_tail_ids: list[int] = []
     for i in range(prior.length, new_length):
         try:
@@ -341,7 +372,7 @@ def _emit_grown_list_alias(
         new_tail_ids.append(elem_id)
 
     value_id = writer.intern_value_alias_grown(
-        prior.value_id, new_tail_ids, "summary_observed"
+        prior.value_id, new_tail_ids, confidence
     )
     # Update cache: the alias's effective element_ids are prior + new_tail.
     combined = list(prior.element_ids)

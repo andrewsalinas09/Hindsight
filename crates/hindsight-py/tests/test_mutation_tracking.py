@@ -70,15 +70,15 @@ def test_store_subscr_marks_container_dirty_and_reconciles(trace_path: Path):
 
 
 def test_append_method_call_is_tracked(trace_path: Path):
-    """`lst.append(x)` should fire CALL with arg0=lst, marking dirty.
-    The next capture re-walks fully and emits ``dirty_reconciled`` — the
-    mutation tracker correctly observed the change.
+    """`lst.append(x)` fires CALL → marks dirty → the next capture sees
+    "dirty + length grew" and emits a Grown alias with
+    ``mutation_tracked`` confidence (the fast path: only the new tail
+    element is interned, no full re-walk).
 
-    Note: this *replaces* the Grown alias optimization for tracked
-    mutations. That's the right tradeoff: dirty_reconciled is the
-    higher-confidence label and represents an active re-verification.
-    The Grown alias path remains useful for mutations the tracker
-    *can't* see (e.g., ctypes, NumPy buffer ops)."""
+    This is the v0.3 ship of the recorder-overhead design: appends are
+    O(k) per iteration, not O(N). For mutations that aren't growth
+    (sort, in-place index assign), the recorder falls back to a full
+    re-walk and emits ``dirty_reconciled``."""
 
     @hindsight.record
     def append_things():
@@ -90,16 +90,18 @@ def test_append_method_call_is_tracked(trace_path: Path):
 
     append_things()
     trace = read_trace(trace_path)
-    list_entries = [v for v in trace["values"] if v["tag"] == 0x07]
-    dirty = _aliases_with_confidence(trace, "dirty_reconciled")
-    # Each append should produce a dirty_reconciled alias because CALL
-    # on `.append` marked the list dirty before the next capture.
-    assert len(dirty) >= 2, (
-        f"appends should produce dirty_reconciled aliases (one per re-capture "
-        f"after a tracked mutation), got {len(dirty)}"
+    grown_mutation_tracked = [
+        v["decoded"]
+        for v in trace["values"]
+        if v["tag"] == 0x15
+        and v["decoded"]["alias_kind"] == "grown"
+        and v["decoded"]["confidence"] == "mutation_tracked"
+    ]
+    # Each tracked append should produce a Grown alias with
+    # mutation_tracked confidence.
+    assert len(grown_mutation_tracked) >= 2, (
+        f"appends should produce mutation_tracked Grown aliases, got {len(grown_mutation_tracked)}"
     )
-    # Underlying list captured inline at least once (first capture).
-    assert len(list_entries) >= 1
 
 
 def test_sort_method_marks_dirty(trace_path: Path):
