@@ -45,6 +45,10 @@ pub enum FormatError {
     InvalidValueTag(u8),
     #[error("invalid hash kind {0:#x}")]
     InvalidHashKind(u8),
+    #[error("invalid alias kind {0:#x} (expected 0x01 Equivalent or 0x02 Grown)")]
+    InvalidAliasKind(u8),
+    #[error("invalid confidence {0:#x}")]
+    InvalidConfidence(u8),
     #[error("varint overflows u64")]
     VarintOverflow,
     #[error("invalid bool byte {0:#x} (expected 0 or 1)")]

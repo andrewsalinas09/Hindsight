@@ -10,7 +10,7 @@
 
 use crate::byte_reader::ByteReader;
 use crate::error::{FormatError, Result};
-use crate::value::{Value, ValueTag};
+use crate::value::{AliasKind, Confidence, Value, ValueTag};
 
 pub(crate) fn decode_value(tag: ValueTag, data: &[u8]) -> Result<Value> {
     let mut sub = ByteReader::new(data);
@@ -103,6 +103,34 @@ pub(crate) fn decode_value(tag: ValueTag, data: &[u8]) -> Result<Value> {
             let id = sub.read_uvarint()?;
             require_consumed(&sub, tag)?;
             Value::TypeRef(id)
+        }
+        ValueTag::AliasRef => {
+            let kind_byte = sub.read_u8()?;
+            let confidence_byte = sub.read_u8()?;
+            let aliased_value_id = sub.read_uvarint()?;
+            let confidence = Confidence::from_u8(confidence_byte)
+                .ok_or(FormatError::InvalidConfidence(confidence_byte))?;
+            let kind = match kind_byte {
+                0x01 => {
+                    require_consumed(&sub, tag)?;
+                    AliasKind::Equivalent
+                }
+                0x02 => {
+                    let count = sub.read_uvarint()? as usize;
+                    let mut new_elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        new_elements.push(sub.read_uvarint()?);
+                    }
+                    require_consumed(&sub, tag)?;
+                    AliasKind::Grown { new_elements }
+                }
+                other => return Err(FormatError::InvalidAliasKind(other)),
+            };
+            Value::Alias {
+                kind,
+                aliased_value_id,
+                confidence,
+            }
         }
     };
     Ok(value)

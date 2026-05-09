@@ -53,6 +53,16 @@ enum Command {
         #[arg(long)]
         reindex: bool,
     },
+    /// Walk the indexed database and content-verify every
+    /// `summary_observed` alias. Upgrades matched aliases to
+    /// `dirty_reconciled` and flags mismatches as
+    /// `uncertain_external`. Use this after a debugging session if you
+    /// want to be sure the recorder's summary-fingerprint optimization
+    /// didn't hide any same-fingerprint mutations.
+    Verify {
+        /// Path to the indexed `.duckdb` file.
+        db: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -79,6 +89,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("hindsight: serve failed: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Verify { db } => match hindsight_index::verify_to_string(&db) {
+            Ok(report) => {
+                println!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("hindsight: verify failed: {e}");
                 ExitCode::FAILURE
             }
         },

@@ -1,8 +1,10 @@
-# Trace format specification (v0.2)
+# Trace format specification (v0.3)
 
 This document specifies the binary format of Hindsight trace files (`.hindsight`). It is the contract between recorders and the rest of the system. Once we have third-party recorders, breaking changes to this format become expensive — we version the format and add fields rather than reorganizing existing ones.
 
-This is v0.2: incorporates feedback from initial review. Sections marked **[CONTESTED]** are decisions that need more thought before lock-in. Sections marked **[DEFERRED]** are recognized issues whose resolution is intentionally pushed beyond v0.
+This is v0.3. The change from v0.2 is additive: a new `Alias` value tag (`0x15`) and `Alias` hash kind (`0x04`) let the recorder express "this value is the same as a previously-emitted one" without re-walking or re-hashing the underlying object. See `playground/recorder-overhead-design.md` for the motivation. v0.2 readers reject the new tag (per their strict-mode policy on unknown tags) — traces produced by v0.3 recorders are not backward compatible. Indexed databases regenerate from traces, so this is not a real cost.
+
+Sections marked **[CONTESTED]** are decisions that need more thought before lock-in. Sections marked **[DEFERRED]** are recognized issues whose resolution is intentionally pushed beyond v0.
 
 ## Goals
 
@@ -61,7 +63,7 @@ The split between initial metadata (known at recording start) and final summary 
 | Offset | Size | Field            | Description                                |
 |--------|------|------------------|--------------------------------------------|
 | 0      | 8    | Magic bytes      | ASCII `"HNDSGHT\0"` (0x48 0x4E 0x44 ...)   |
-| 8      | 2    | Format version   | Major.minor as two u8s. v0.2 = 0x00 0x02.  |
+| 8      | 2    | Format version   | Major.minor as two u8s. v0.3 = 0x00 0x03.  |
 | 10     | 2    | Header flags     | Bitfield, reserved. Must be zero in v0.2.  |
 | 12     | 4    | Header length    | u32, total header section size including this field. v0.2 = 64. |
 | 16     | 16   | Trace UUID       | Random 128-bit identifier for this trace.  |
@@ -711,7 +713,8 @@ The value table stores program values referenced by events. Each entry has a typ
 | `0x10` | summary       | structured summary of large/complex values (see below)  |
 | `0x11` | type ref      | string ID referencing a type/class name                 |
 | `0x12` | exception unwind sentinel | Empty. Always at value table index 1.       |
-| `0x13`-`0x7F` | reserved primitive |                                                  |
+| `0x15` | alias ref     | references a prior value_id; see "Alias values" below   |
+| `0x13`-`0x14`, `0x16`-`0x7F` | reserved primitive |                                   |
 | `0x80`-`0xFF` | language-specific |                                                  |
 
 Tags `0x80`-`0xFF` are available for language-specific encodings. Each language frontend documents its tag assignments in a companion document.
@@ -753,6 +756,41 @@ When a value is summarized, the value table entry's hash kind is `summary_hash` 
 
 If the recorder is willing to pay the cost of computing a full content hash for a summarized value (e.g., for known-cheap types like NumPy arrays where hashing the underlying buffer is fast), it can use hash kind `content_hash`. The choice is recorder-configurable.
 
+### Alias values (`0x15`)
+
+An alias entry references a previously-emitted value. It exists so the recorder can express "the variable now holds the same value as it did at value_id N" without re-walking the underlying object or paying a content hash on every line event. See `playground/recorder-overhead-design.md` for the architectural motivation.
+
+```
++----------------+----------------+----------------+----------------+
+| Alias kind     | Confidence     | Aliased        | (Grown only:)  |
+| u8             | u8             | value ID       | New tail        |
+|                |                | varint         | varint count   |
+|                |                |                | + varints      |
++----------------+----------------+----------------+----------------+
+```
+
+Fields:
+- **Alias kind**: 1 byte. `0x01` = `Equivalent` (this value has the same content as the aliased one). `0x02` = `Grown` (this value is the aliased one with new tail elements appended).
+- **Confidence**: 1 byte. See "Confidence semantics" below. The recorder records *how it knows* the alias is correct, so downstream tools (and the LLM) can caveat appropriately.
+- **Aliased value ID**: varint. The prior `value_id` this alias points at. Must be less than this entry's own `value_id` (no forward refs, same constraint as containers).
+- **Grown tail** (only when alias kind = `Grown`): a varint count followed by that many `value_id` varints. These are the new elements appended after the aliased container's existing elements. For ordered containers (lists, tuples) the order is "aliased elements then tail." For dicts (which can also grow), the tail is a flat list of `(key_id, value_id)` pairs encoded as alternating varints, count being the number of pairs.
+
+The hash field on an alias entry is set to all zeros and `hash_kind` is `Alias` (`0x04`). Aliases are not deduplicated — every alias produces a fresh `value_id`.
+
+### Confidence semantics
+
+Each value entry has a confidence level describing how well the recorder knows the entry reflects the true program state at the time of capture. For non-alias entries, confidence is *derived* from `(hash_kind, tag)`. For alias entries, confidence is encoded explicitly in the payload. Indexers and downstream tools materialize confidence as a column on the `values` table.
+
+| Confidence              | Encoding | When emitted                                                                 |
+|-------------------------|----------|------------------------------------------------------------------------------|
+| `content_exact`         | `0x01`   | Inline value with `Content` hash kind. Recorder fully walked + hashed it.   |
+| `mutation_tracked`      | `0x02`   | Alias whose freshness is guaranteed by opcode-level mutation tracking.       |
+| `dirty_reconciled`      | `0x03`   | Alias re-validated by walking the live container after a mutation event.    |
+| `summary_observed`      | `0x04`   | Alias whose freshness was inferred from a summary fingerprint match (length + endpoint identity), not re-checked element-by-element. *May* hide same-fingerprint mutations. Also: any inline `Summary` value uses this category. |
+| `uncertain_external`    | `0x05`   | Identity-hashed value, or alias known to be possibly stale (C-extension mutation, ctypes, etc.). |
+
+The confidence column is for narration: when the LLM reports a value, it can say "as of event N (mutation_tracked)" vs. "as of event N (summary_observed; not re-verified)." The trace itself never lies — it always reports the confidence level honestly.
+
 ### Cycle reference (`0x0A`)
 
 A cycle reference is used inside a container value's encoding to mark a position where a cycle would otherwise cause infinite recursion.
@@ -791,6 +829,7 @@ For hashing to be deterministic, values must have a canonical byte representatio
 - set: elements sorted by canonical representation, then concatenated
 - cycle_ref: 1 byte 0xFF followed by depth as 4-byte big-endian
 - summary: when content_hash kind is used, the canonical representation of the full value (recorder must compute this); when summary_hash kind is used, the concatenation of type ref string + length as 8-byte big-endian + repr string
+- alias: empty. Aliases use hash kind `Alias` (0x04) and the hash field is set to all zeros. Aliases are not deduplicated — each alias entry is a fresh `value_id`.
 
 Canonical representation is for hashing only; the on-disk encoding can be different (e.g., little-endian for performance).
 

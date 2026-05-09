@@ -101,7 +101,21 @@ const CREATE_TABLES: &str = r#"
         type_name             VARCHAR,
         repr_text             VARCHAR,
         summary_length        BIGINT,
-        type_ref_name         VARCHAR
+        type_ref_name         VARCHAR,
+        -- v0.3 additions: confidence label + alias source.
+        --
+        -- `confidence` is one of: content_exact, mutation_tracked,
+        -- dirty_reconciled, summary_observed, uncertain_external.
+        -- For non-alias entries it is derived from (hash_kind, type_tag);
+        -- for aliases it comes from the wire-format alias payload.
+        --
+        -- `aliased_value_id` is NULL for non-aliases. For aliases it points
+        -- at the source value_id whose contents were inherited (the
+        -- indexer materializes the alias as its effective container in
+        -- value_elements, so most queries never need to follow the alias
+        -- pointer themselves).
+        confidence            VARCHAR NOT NULL,
+        aliased_value_id      BIGINT
     );
 
     CREATE TABLE value_elements (
@@ -218,6 +232,8 @@ const CREATE_INDEXES: &str = r#"
     CREATE INDEX values_type_name ON values(type_name);
     CREATE INDEX values_int_value ON values(int_value);
     CREATE INDEX values_string_value ON values(string_value);
+    CREATE INDEX values_confidence ON values(confidence);
+    CREATE INDEX values_aliased_value_id ON values(aliased_value_id);
 
     CREATE INDEX value_elements_container ON value_elements(container_value_id);
     CREATE INDEX value_elements_element ON value_elements(element_value_id);

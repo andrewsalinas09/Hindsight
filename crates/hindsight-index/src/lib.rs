@@ -28,8 +28,10 @@ mod frames;
 mod metadata;
 mod schema;
 mod values;
+pub mod verify;
 
 pub use error::{IndexError, Result};
+pub use verify::{VerifyReport, verify, verify_to_string};
 
 use std::path::Path;
 

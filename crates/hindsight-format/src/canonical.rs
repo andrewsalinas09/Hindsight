@@ -92,6 +92,15 @@ pub(crate) fn canonical_inline(value: &Value, lookup: &dyn CanonicalLookup) -> V
                  intern_value_summary; content_hash on summaries is not supported here"
             );
         }
+        Value::Alias { .. } => {
+            // Aliases use HashKind::Alias with an all-zero hash field per
+            // spec. They never reach the canonical_inline path because
+            // intern_value_alias_* methods bypass canonicalization entirely.
+            unreachable!(
+                "writer policy: Alias values are interned via \
+                 intern_value_alias_*; they do not have a canonical hash"
+            );
+        }
     }
 }
 

@@ -18,6 +18,8 @@ pub enum HashKind {
     Summary = 0x02,
     /// Language-level object identity (Python `id()`, etc.).
     Identity = 0x03,
+    /// Marker on alias entries — the hash field is all zeros and meaningless.
+    Alias = 0x04,
 }
 
 impl HashKind {
@@ -30,6 +32,7 @@ impl HashKind {
             0x01 => Self::Content,
             0x02 => Self::Summary,
             0x03 => Self::Identity,
+            0x04 => Self::Alias,
             _ => return None,
         })
     }
@@ -53,6 +56,8 @@ pub enum ValueTag {
     Summary = 0x10,
     TypeRef = 0x11,
     ExceptionUnwindSentinel = 0x12,
+    /// Alias to a previously-emitted value. See spec §"Alias values".
+    AliasRef = 0x15,
 }
 
 impl ValueTag {
@@ -76,8 +81,105 @@ impl ValueTag {
             0x10 => Self::Summary,
             0x11 => Self::TypeRef,
             0x12 => Self::ExceptionUnwindSentinel,
+            0x15 => Self::AliasRef,
             _ => return None,
         })
+    }
+}
+
+/// Confidence level for a value entry. Captures *how the recorder knows* the
+/// entry reflects program state at capture time. See spec §"Confidence
+/// semantics" for the full table.
+///
+/// Wire encoding: 1 byte. Stored on disk only inside [`Value::Alias`]
+/// payloads; for non-alias entries it is *derived* from `(hash_kind, tag)`
+/// via [`derive_confidence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Confidence {
+    /// Inline value with full content hash. Recorder walked + hashed it.
+    ContentExact = 0x01,
+    /// Alias whose freshness is guaranteed by opcode-level mutation tracking.
+    MutationTracked = 0x02,
+    /// Alias re-validated by walking the live container after a mutation.
+    DirtyReconciled = 0x03,
+    /// Alias inferred from a summary fingerprint match. May hide same-
+    /// fingerprint mutations. Also used for inline `Summary` values, where
+    /// the recorder hashed only the summary bytes.
+    SummaryObserved = 0x04,
+    /// Identity-hashed, or alias known to be possibly stale (C extension
+    /// mutation, ctypes, etc.).
+    UncertainExternal = 0x05,
+}
+
+impl Confidence {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(b: u8) -> Option<Self> {
+        Some(match b {
+            0x01 => Self::ContentExact,
+            0x02 => Self::MutationTracked,
+            0x03 => Self::DirtyReconciled,
+            0x04 => Self::SummaryObserved,
+            0x05 => Self::UncertainExternal,
+            _ => return None,
+        })
+    }
+
+    /// Stable lower-snake-case name used by the indexer's `confidence` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentExact => "content_exact",
+            Self::MutationTracked => "mutation_tracked",
+            Self::DirtyReconciled => "dirty_reconciled",
+            Self::SummaryObserved => "summary_observed",
+            Self::UncertainExternal => "uncertain_external",
+        }
+    }
+}
+
+/// Derive a confidence label for a non-alias value entry from its hash kind
+/// and tag. Aliases carry their own confidence in the payload — this
+/// function is only meaningful for non-alias entries.
+pub fn derive_confidence(hash_kind: HashKind, tag: ValueTag) -> Confidence {
+    match (hash_kind, tag) {
+        (HashKind::Alias, _) | (_, ValueTag::AliasRef) => {
+            // Aliases carry confidence in the payload. Callers should not
+            // ask this function about them; we return UncertainExternal as
+            // a safe fallback rather than panic.
+            Confidence::UncertainExternal
+        }
+        (HashKind::Content, _) => Confidence::ContentExact,
+        (HashKind::Summary, _) => Confidence::SummaryObserved,
+        (HashKind::Identity, _) => Confidence::UncertainExternal,
+    }
+}
+
+/// Kind of an alias entry. Distinguishes "fully-equivalent re-snapshot" from
+/// "previous container plus new tail elements" — the latter is the
+/// append-in-a-loop fast path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AliasKind {
+    /// Same content as the aliased value.
+    Equivalent,
+    /// Aliased container plus appended tail elements. For lists/tuples/sets
+    /// the tail is a flat list of value IDs. For dicts, the tail is a flat
+    /// list of `(key_id, value_id)` pairs encoded as alternating value IDs.
+    Grown {
+        /// New element value IDs appended after the aliased container's
+        /// existing elements. For dicts this is interpreted as `(k, v)` pairs.
+        new_elements: Vec<ValueId>,
+    },
+}
+
+impl AliasKind {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Equivalent => 0x01,
+            Self::Grown { .. } => 0x02,
+        }
     }
 }
 
@@ -121,6 +223,12 @@ pub enum Value {
     TypeRef(StringId),
     /// Sentinel for unwound exception frames; reserved at value table index 1.
     ExceptionUnwindSentinel,
+    /// Alias to a previously-emitted value. See spec §"Alias values".
+    Alias {
+        kind: AliasKind,
+        aliased_value_id: ValueId,
+        confidence: Confidence,
+    },
 }
 
 impl Value {
@@ -140,6 +248,7 @@ impl Value {
             Value::Summary { .. } => ValueTag::Summary,
             Value::TypeRef(_) => ValueTag::TypeRef,
             Value::ExceptionUnwindSentinel => ValueTag::ExceptionUnwindSentinel,
+            Value::Alias { .. } => ValueTag::AliasRef,
         }
     }
 }

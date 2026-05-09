@@ -5,7 +5,7 @@
 
 use std::io::{self, Write};
 
-use crate::value::Value;
+use crate::value::{AliasKind, Value};
 use crate::varint::{write_svarint, write_uvarint};
 
 /// Write the on-disk data bytes for a value (the bytes following the
@@ -58,6 +58,21 @@ pub fn write_value_data<W: Write>(w: &mut W, value: &Value) -> io::Result<()> {
         }
         Value::TypeRef(string_id) => {
             write_uvarint(w, *string_id)?;
+        }
+        Value::Alias {
+            kind,
+            aliased_value_id,
+            confidence,
+        } => {
+            w.write_all(&[kind.as_u8()])?;
+            w.write_all(&[confidence.as_u8()])?;
+            write_uvarint(w, *aliased_value_id)?;
+            if let AliasKind::Grown { new_elements } = kind {
+                write_uvarint(w, new_elements.len() as u64)?;
+                for id in new_elements {
+                    write_uvarint(w, *id)?;
+                }
+            }
         }
     }
     Ok(())

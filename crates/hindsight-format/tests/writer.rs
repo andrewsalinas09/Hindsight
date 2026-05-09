@@ -552,3 +552,174 @@ fn identity_hashed_value_does_not_dedup_with_content_hashed() {
     let b = w.intern_value_with_identity(Value::Int(7), [0xAB; 16]);
     assert_ne!(a, b, "different hash kinds must not dedup");
 }
+
+// ----------------------------------------------------------------------------
+// Alias variant tests (v0.3 addition)
+// ----------------------------------------------------------------------------
+
+fn finalize_writer(w: TraceWriter) -> Vec<u8> {
+    use hindsight_format::{Finalization, ScopeResolution};
+    w.finish_to_bytes(Finalization {
+        recording_end_ns: 1_000_000_000,
+        scope_resolution: ScopeResolution::default(),
+    })
+    .expect("finalize")
+}
+
+#[test]
+fn alias_equivalent_emits_fresh_value_id_pointing_at_prior() {
+    use hindsight_format::{AliasKind, Confidence};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let int_a = w.intern_value_inline(Value::Int(1));
+    let int_b = w.intern_value_inline(Value::Int(2));
+    let original = w.intern_value_inline(Value::List(vec![int_a, int_b]));
+
+    let alias = w
+        .intern_value_alias(AliasKind::Equivalent, original, Confidence::SummaryObserved)
+        .unwrap();
+    assert_ne!(alias, original, "alias must produce a fresh value_id");
+}
+
+#[test]
+fn alias_equivalent_does_not_dedup() {
+    use hindsight_format::{AliasKind, Confidence};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let one = w.intern_value_inline(Value::Int(1));
+    let target = w.intern_value_inline(Value::List(vec![one]));
+    let a1 = w
+        .intern_value_alias(AliasKind::Equivalent, target, Confidence::SummaryObserved)
+        .unwrap();
+    let a2 = w
+        .intern_value_alias(AliasKind::Equivalent, target, Confidence::SummaryObserved)
+        .unwrap();
+    assert_ne!(
+        a1, a2,
+        "two aliases to the same target must each get a fresh id"
+    );
+}
+
+#[test]
+fn alias_grown_carries_new_tail_elements() {
+    use hindsight_format::{AliasKind, Confidence};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let i1 = w.intern_value_inline(Value::Int(1));
+    let i2 = w.intern_value_inline(Value::Int(2));
+    let i3 = w.intern_value_inline(Value::Int(3));
+    let original = w.intern_value_inline(Value::List(vec![i1, i2]));
+    let grown = w
+        .intern_value_alias(
+            AliasKind::Grown {
+                new_elements: vec![i3],
+            },
+            original,
+            Confidence::SummaryObserved,
+        )
+        .unwrap();
+    assert_ne!(grown, original);
+}
+
+#[test]
+fn alias_referencing_unknown_value_id_is_rejected() {
+    use hindsight_format::{AliasKind, Confidence};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let result = w.intern_value_alias(AliasKind::Equivalent, 999_999, Confidence::ContentExact);
+    assert!(result.is_err(), "must reject unknown aliased value_id");
+}
+
+#[test]
+fn alias_grown_with_unknown_tail_element_is_rejected() {
+    use hindsight_format::{AliasKind, Confidence};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let target = w.intern_value_inline(Value::List(vec![]));
+    let result = w.intern_value_alias(
+        AliasKind::Grown {
+            new_elements: vec![999_999],
+        },
+        target,
+        Confidence::ContentExact,
+    );
+    assert!(result.is_err(), "must reject unknown new-element value_id");
+}
+
+#[test]
+fn alias_round_trips_through_finalize_and_reader() {
+    use hindsight_format::{AliasKind, Confidence, TraceReader};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let i1 = w.intern_value_inline(Value::Int(10));
+    let i2 = w.intern_value_inline(Value::Int(20));
+    let i3 = w.intern_value_inline(Value::Int(30));
+    let original = w.intern_value_inline(Value::List(vec![i1, i2]));
+    let alias_eq = w
+        .intern_value_alias(AliasKind::Equivalent, original, Confidence::MutationTracked)
+        .unwrap();
+    let alias_grown = w
+        .intern_value_alias(
+            AliasKind::Grown {
+                new_elements: vec![i3],
+            },
+            original,
+            Confidence::DirtyReconciled,
+        )
+        .unwrap();
+    let bytes = finalize_writer(w);
+    let reader = TraceReader::from_bytes(&bytes).expect("finalized trace round-trips");
+    let values = reader.values();
+
+    let eq_entry = &values[alias_eq as usize];
+    assert!(matches!(eq_entry.hash_kind, HashKind::Alias));
+    match &eq_entry.value {
+        Value::Alias {
+            kind: AliasKind::Equivalent,
+            aliased_value_id,
+            confidence,
+        } => {
+            assert_eq!(*aliased_value_id, original);
+            assert_eq!(*confidence, Confidence::MutationTracked);
+        }
+        other => panic!("expected Equivalent alias, got {other:?}"),
+    }
+
+    let grown_entry = &values[alias_grown as usize];
+    match &grown_entry.value {
+        Value::Alias {
+            kind: AliasKind::Grown { new_elements },
+            aliased_value_id,
+            confidence,
+        } => {
+            assert_eq!(*aliased_value_id, original);
+            assert_eq!(*confidence, Confidence::DirtyReconciled);
+            assert_eq!(new_elements, &vec![i3]);
+        }
+        other => panic!("expected Grown alias, got {other:?}"),
+    }
+}
+
+#[test]
+fn confidence_round_trips_all_five_variants() {
+    use hindsight_format::{AliasKind, Confidence, TraceReader};
+    let mut w = TraceWriter::new(worked_example_metadata());
+    let target = w.intern_value_inline(Value::Int(0));
+    let variants = [
+        Confidence::ContentExact,
+        Confidence::MutationTracked,
+        Confidence::DirtyReconciled,
+        Confidence::SummaryObserved,
+        Confidence::UncertainExternal,
+    ];
+    let mut ids = Vec::new();
+    for c in variants {
+        ids.push(
+            w.intern_value_alias(AliasKind::Equivalent, target, c)
+                .unwrap(),
+        );
+    }
+    let bytes = finalize_writer(w);
+    let reader = TraceReader::from_bytes(&bytes).unwrap();
+    for (id, expected) in ids.iter().zip(variants.iter()) {
+        if let Value::Alias { confidence, .. } = &reader.values()[*id as usize].value {
+            assert_eq!(confidence, expected);
+        } else {
+            panic!("expected alias at id {id}");
+        }
+    }
+}

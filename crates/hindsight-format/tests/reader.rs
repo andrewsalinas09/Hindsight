@@ -82,7 +82,7 @@ fn round_trip_finalized_empty_trace() {
     let r = TraceReader::from_bytes(&bytes).unwrap();
     let h = r.header();
     assert_eq!(h.format_version_major, 0);
-    assert_eq!(h.format_version_minor, 2);
+    assert_eq!(h.format_version_minor, 3);
     assert_eq!(h.flags, 0);
     assert_eq!(h.header_length, HEADER_LENGTH);
     assert_eq!(h.trace_uuid, [0xCC; 16]);
@@ -756,7 +756,7 @@ fn malformed_header_wrong_version() {
     let result = TraceReader::from_bytes(&bytes);
     assert!(matches!(
         result,
-        Err(FormatError::UnsupportedVersion { major: 9, minor: 2 })
+        Err(FormatError::UnsupportedVersion { major: 9, minor: 3 })
     ));
 }
 

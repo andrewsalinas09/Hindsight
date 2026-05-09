@@ -2,13 +2,15 @@
 
 //! Binary trace format reader and writer for Hindsight.
 //!
-//! The format is specified in `docs/trace-format.md` (v0.2). This crate
-//! implements a v0.2 writer that produces a fully-finalized file (header,
+//! The format is specified in `docs/trace-format.md` (v0.3). This crate
+//! implements a v0.3 writer that produces a fully-finalized file (header,
 //! initial metadata, source bundle, initial string and value tables, one
-//! event block carrying any of the nine v0.2 event types, final summary,
+//! event block carrying any of the nine v0.3 event types, final summary,
 //! checkpoint index, and footer) and a matching reader that handles both
 //! finalized and unfinalized (interrupted) files. Multi-block streams,
 //! checkpoints, table updates, and table snapshots are not yet implemented.
+//!
+//! v0.3 adds the [`Value::Alias`] variant — see `playground/recorder-overhead-design.md`.
 
 mod byte_reader;
 mod canonical;
@@ -33,7 +35,9 @@ pub use reader::{
     CheckpointEntry, EventBlockInfo, FinalSummary, Footer, Header, MetadataBlock, SourceFile,
     TraceCursor, TraceReader, ValueEntry,
 };
-pub use value::{HashKind, StringId, Value, ValueId, ValueTag};
+pub use value::{
+    AliasKind, Confidence, HashKind, StringId, Value, ValueId, ValueTag, derive_confidence,
+};
 pub use writer::{
     BLOCK_TAG_CHECKPOINT, BLOCK_TAG_EVENT, BLOCK_TAG_TABLE_SNAPSHOT, BLOCK_TAG_TABLE_UPDATE,
     EXCEPTION_UNWIND_VALUE_ID, ExcludedFunction, FILE_MAGIC, FOOTER_LENGTH, FOOTER_MAGIC,

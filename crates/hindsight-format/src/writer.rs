@@ -46,7 +46,7 @@ use crate::event::{
     FunctionExit, LineDelta, Note, ScopeBoundary, event_serialized_size, write_event,
 };
 use crate::metadata::Metadata;
-use crate::value::{HashKind, StringId, Value, ValueId, ValueTag};
+use crate::value::{AliasKind, Confidence, HashKind, StringId, Value, ValueId, ValueTag};
 use crate::varint::{uvarint_len, write_uvarint};
 
 pub type FileId = u64;
@@ -58,7 +58,7 @@ pub const FILE_MAGIC: [u8; 8] = *b"HNDSGHT\0";
 pub const FOOTER_MAGIC: [u8; 8] = *b"HNDFOOT\0";
 
 pub const FORMAT_VERSION_MAJOR: u8 = 0;
-pub const FORMAT_VERSION_MINOR: u8 = 2;
+pub const FORMAT_VERSION_MINOR: u8 = 3;
 pub const HEADER_LENGTH: u32 = 64;
 pub const FOOTER_LENGTH: u32 = 32;
 
@@ -441,6 +441,57 @@ impl TraceWriter {
         self.assert_child_ids_exist(&value);
         let canonical = canonical_identity(&identity_hash);
         self.intern_value_unique(value, HashKind::Identity, identity_hash, canonical)
+    }
+
+    /// Emit an alias to a previously-interned value. The new entry references
+    /// `aliased_value_id` (which must already exist) and carries the recorder's
+    /// confidence in the alias's freshness. Aliases are never deduplicated —
+    /// each call produces a fresh `value_id`.
+    ///
+    /// `kind = AliasKind::Equivalent` means "this value is the same content as
+    /// the aliased one." `kind = AliasKind::Grown { new_elements }` means
+    /// "this value is the aliased container plus these additional elements
+    /// at the tail." See spec §"Alias values".
+    ///
+    /// O(1) for `Equivalent`; O(k) for `Grown` where k is the tail length —
+    /// no walk over the full container, no content hashing.
+    pub fn intern_value_alias(
+        &mut self,
+        kind: AliasKind,
+        aliased_value_id: ValueId,
+        confidence: Confidence,
+    ) -> Result<ValueId> {
+        if (aliased_value_id as usize) >= self.values.len() {
+            return Err(FormatError::UnknownValueId(aliased_value_id));
+        }
+        if let AliasKind::Grown { new_elements } = &kind {
+            for id in new_elements {
+                if (*id as usize) >= self.values.len() {
+                    return Err(FormatError::UnknownValueId(*id));
+                }
+            }
+        }
+        let value = Value::Alias {
+            kind,
+            aliased_value_id,
+            confidence,
+        };
+        let mut encoded_data = Vec::new();
+        write_value_data(&mut encoded_data, &value).expect("write to Vec<u8> never fails");
+        let id = self.values.len() as ValueId;
+        // Aliases are never deduplicated — emit a fresh entry. We still need
+        // a canonical_repr stored alongside to keep the canonical-lookup
+        // contract for content-hashed parents; we use the encoded data as a
+        // placeholder (it's already content-derived from the alias payload).
+        let canonical_repr = encoded_data.clone();
+        self.values.push(StoredValue {
+            value,
+            encoded_data,
+            canonical_repr,
+            hash_kind: HashKind::Alias,
+            hash: [0u8; 16],
+        });
+        Ok(id)
     }
 
     fn intern_value_unique(

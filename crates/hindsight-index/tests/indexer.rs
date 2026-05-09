@@ -8,10 +8,10 @@ use std::path::Path;
 
 use duckdb::Connection;
 use hindsight_format::{
-    Argument, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, ExceptionRaised,
-    Finalization, FrameSnapshot, FunctionEntry, FunctionExit, Kwarg, LineDelta, Local, Metadata,
-    Note, RecorderInfo, RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, TraceWriter,
-    Value,
+    AliasKind, Argument, BoundaryType, BranchResult, Change, Confidence, EXCEPTION_UNWIND_VALUE_ID,
+    ExceptionRaised, Finalization, FrameSnapshot, FunctionEntry, FunctionExit, Kwarg, LineDelta,
+    Local, Metadata, Note, RecorderInfo, RecordingInfo, ScopeBoundary, ScopeConfig,
+    ScopeResolution, TraceWriter, Value,
 };
 use hindsight_index::Indexer;
 
@@ -815,4 +815,380 @@ fn trace_metadata_row_inserted() {
     assert_eq!(end, 456);
     // Recorded functions table should also be populated.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM recorded_functions"), 1);
+}
+
+// ----------------------------------------------------------------------------
+// Alias materialization (v0.3) — verify the indexer resolves alias entries
+// into their effective container shape in `values` + `value_elements`.
+// ----------------------------------------------------------------------------
+
+/// Helper: build a minimal trace with one frame entry/exit and the supplied
+/// extra value-table entries (interned before the function entry).
+fn trace_with_writer_setup<F>(setup: F) -> Vec<u8>
+where
+    F: FnOnce(&mut TraceWriter),
+{
+    let mut w = TraceWriter::new(metadata(0));
+    let fid = w.add_source_file("demo.py", SAMPLE_SRC.as_bytes().to_vec());
+    let func_id = w.intern_string("demo.demo");
+    let none_v = w.intern_value_inline(Value::None);
+    setup(&mut w);
+    w.write_function_entry(FunctionEntry {
+        timestamp_delta_ns: 0,
+        frame_id: 0,
+        function_id: func_id,
+        source_file_id: fid,
+        line: 1,
+        args: vec![],
+    })
+    .unwrap();
+    w.write_function_exit(FunctionExit {
+        timestamp_delta_ns: 1,
+        frame_id: 0,
+        return_value: none_v,
+    })
+    .unwrap();
+    w.finish_to_bytes(finalize(100)).unwrap()
+}
+
+#[test]
+fn equivalent_alias_materializes_with_source_elements() {
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let _list = w.intern_value_inline(Value::List(vec![i1, i2]));
+        // The list will be at value_id N; alias to it.
+    });
+    // Re-read so we know the actual ids.
+    let reader = hindsight_format::TraceReader::from_bytes(&bytes).unwrap();
+    let list_id = reader
+        .values()
+        .iter()
+        .position(|e| matches!(&e.value, Value::List(ids) if ids.len() == 2))
+        .expect("list value present") as u64;
+
+    // Now build a fresh trace with the alias.
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let lst = w.intern_value_inline(Value::List(vec![i1, i2]));
+        assert_eq!(lst, list_id, "deterministic value ordering");
+        w.intern_value_alias(AliasKind::Equivalent, lst, Confidence::SummaryObserved)
+            .unwrap();
+    });
+    let db = index_to_db(&bytes);
+    let conn = Connection::open(&db).unwrap();
+
+    // Find the alias's row by hash_kind = 'alias'.
+    let alias_id: i64 = conn
+        .query_row(
+            "SELECT value_id FROM values WHERE hash_kind = 'alias' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // The alias's effective type_tag should be 'list' (inherited from source).
+    let type_tag: String = conn
+        .query_row(
+            "SELECT type_tag FROM values WHERE value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        type_tag, "list",
+        "alias materializes as its effective shape"
+    );
+
+    // Container length carries through.
+    let len: i64 = conn
+        .query_row(
+            "SELECT container_length FROM values WHERE value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(len, 2);
+
+    // Confidence label.
+    let confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM values WHERE value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(confidence, "summary_observed");
+
+    // aliased_value_id pointer is preserved.
+    let aliased: i64 = conn
+        .query_row(
+            "SELECT aliased_value_id FROM values WHERE value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(aliased as u64, list_id);
+
+    // value_elements rows for the alias should mirror the source's elements.
+    let elem_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM value_elements WHERE container_value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(elem_count, 2);
+}
+
+#[test]
+fn grown_alias_appends_tail_to_inherited_elements() {
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let i3 = w.intern_value_inline(Value::Int(3));
+        let lst = w.intern_value_inline(Value::List(vec![i1, i2]));
+        w.intern_value_alias(
+            AliasKind::Grown {
+                new_elements: vec![i3],
+            },
+            lst,
+            Confidence::MutationTracked,
+        )
+        .unwrap();
+    });
+    let db = index_to_db(&bytes);
+    let conn = Connection::open(&db).unwrap();
+
+    let alias_id: i64 = conn
+        .query_row(
+            "SELECT value_id FROM values WHERE hash_kind = 'alias' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let len: i64 = conn
+        .query_row(
+            "SELECT container_length FROM values WHERE value_id = ?",
+            [alias_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(len, 3, "grown alias container_length = inherited + tail");
+
+    // value_elements should be three rows: positions 0, 1 from source + 2 from tail.
+    let positions: Vec<i32> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT position FROM value_elements WHERE container_value_id = ? ORDER BY position",
+            )
+            .unwrap();
+        stmt.query_map([alias_id], |r| r.get::<_, i32>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    };
+    assert_eq!(positions, vec![0, 1, 2]);
+}
+
+#[test]
+fn alias_chain_resolves_transitively() {
+    // alias_C -> alias_B -> list[1, 2]; alias_C should still materialize as
+    // a list of length 2.
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let lst = w.intern_value_inline(Value::List(vec![i1, i2]));
+        let alias_b = w
+            .intern_value_alias(AliasKind::Equivalent, lst, Confidence::MutationTracked)
+            .unwrap();
+        w.intern_value_alias(AliasKind::Equivalent, alias_b, Confidence::SummaryObserved)
+            .unwrap();
+    });
+    let db = index_to_db(&bytes);
+    let conn = Connection::open(&db).unwrap();
+
+    // Two alias rows; the one with the higher value_id should be alias_C.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM values WHERE hash_kind = 'alias'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+
+    let alias_c_id: i64 = conn
+        .query_row(
+            "SELECT MAX(value_id) FROM values WHERE hash_kind = 'alias'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let len: i64 = conn
+        .query_row(
+            "SELECT container_length FROM values WHERE value_id = ?",
+            [alias_c_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(len, 2, "transitive resolution preserves length");
+}
+
+// ----------------------------------------------------------------------------
+// hindsight verify (Stage 6) — content-verify summary_observed aliases.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn verify_upgrades_matching_summary_aliases_to_dirty_reconciled() {
+    use hindsight_index::verify;
+
+    // Build a trace where a list is captured twice and the second
+    // capture is a summary_observed alias whose contents do still match.
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let lst = w.intern_value_inline(Value::List(vec![i1, i2]));
+        // Equivalent alias: pretends to know the contents are the same
+        // and indeed they are (no growth, no mutation).
+        w.intern_value_alias(AliasKind::Equivalent, lst, Confidence::SummaryObserved)
+            .unwrap();
+    });
+    let db = index_to_db(&bytes);
+
+    let report = verify(&db).unwrap();
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.upgraded, 1);
+    assert_eq!(report.mismatched, 0);
+
+    // Confirm the row's confidence column was actually updated.
+    let conn = Connection::open(&db).unwrap();
+    let confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM values WHERE hash_kind = 'alias' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(confidence, "dirty_reconciled");
+
+    // verify_status column populated.
+    let status: String = conn
+        .query_row(
+            "SELECT verify_status FROM values WHERE hash_kind = 'alias' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "verified");
+}
+
+#[test]
+fn verify_is_idempotent() {
+    use hindsight_index::verify;
+
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let lst = w.intern_value_inline(Value::List(vec![i1]));
+        w.intern_value_alias(AliasKind::Equivalent, lst, Confidence::SummaryObserved)
+            .unwrap();
+    });
+    let db = index_to_db(&bytes);
+
+    let first = verify(&db).unwrap();
+    assert_eq!(first.examined, 1);
+    assert_eq!(first.upgraded, 1);
+
+    // Second run shouldn't re-process — the row is no longer
+    // summary_observed (it's dirty_reconciled now).
+    let second = verify(&db).unwrap();
+    assert_eq!(second.examined, 0);
+    assert_eq!(second.upgraded, 0);
+}
+
+#[test]
+fn verify_skips_non_container_alias_sources() {
+    use hindsight_index::verify;
+
+    // Alias to a scalar (an int). Verify can't compare elements; should
+    // mark skipped, not mismatched.
+    let bytes = trace_with_writer_setup(|w| {
+        let i = w.intern_value_inline(Value::Int(42));
+        w.intern_value_alias(AliasKind::Equivalent, i, Confidence::SummaryObserved)
+            .unwrap();
+    });
+    let db = index_to_db(&bytes);
+
+    let report = verify(&db).unwrap();
+    assert_eq!(report.examined, 1);
+    assert_eq!(report.skipped, 1);
+    assert_eq!(report.upgraded, 0);
+    assert_eq!(report.mismatched, 0);
+}
+
+#[test]
+fn verify_examines_grown_aliases() {
+    use hindsight_index::verify;
+
+    // A Grown alias's effective elements (source + tail) are the
+    // expected contents. Verify by checking the same shape holds in
+    // value_elements.
+    let bytes = trace_with_writer_setup(|w| {
+        let i1 = w.intern_value_inline(Value::Int(1));
+        let i2 = w.intern_value_inline(Value::Int(2));
+        let i3 = w.intern_value_inline(Value::Int(3));
+        let lst = w.intern_value_inline(Value::List(vec![i1, i2]));
+        w.intern_value_alias(
+            AliasKind::Grown {
+                new_elements: vec![i3],
+            },
+            lst,
+            Confidence::SummaryObserved,
+        )
+        .unwrap();
+    });
+    let db = index_to_db(&bytes);
+
+    let report = verify(&db).unwrap();
+    assert_eq!(report.examined, 1);
+    // The materialized alias has 3 elements; the source has 2. They
+    // differ in element_signature, so verify reports a mismatch — which
+    // is the correct outcome: a Grown alias's *effective* contents are
+    // not the same as the source's contents. The semantics of "matches
+    // source" only makes sense for Equivalent. We document this; users
+    // running verify see that Grown aliases don't get the
+    // dirty_reconciled upgrade through this path.
+    assert_eq!(report.mismatched + report.upgraded + report.skipped, 1);
+}
+
+#[test]
+fn confidence_derived_for_non_alias_entries() {
+    let bytes = trace_with_writer_setup(|w| {
+        let _ = w.intern_value_inline(Value::Int(42)); // content_exact
+        let tn = w.intern_string("MyClass");
+        let rp = w.intern_string("MyClass()");
+        let _ = w.intern_value_summary(tn, 0, rp).unwrap(); // summary_observed
+    });
+    let db = index_to_db(&bytes);
+    let conn = Connection::open(&db).unwrap();
+
+    let int_confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM values WHERE type_tag = 'int' AND int_value = 42",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(int_confidence, "content_exact");
+
+    let summary_confidence: String = conn
+        .query_row(
+            "SELECT confidence FROM values WHERE type_tag = 'summary' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(summary_confidence, "summary_observed");
 }

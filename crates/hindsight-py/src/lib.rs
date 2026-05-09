@@ -28,11 +28,11 @@ use pyo3::types::{
 };
 
 use hindsight_format::{
-    Argument, BoundaryType, BranchResult, Change, EXCEPTION_UNWIND_VALUE_ID, Event, EventTag,
-    ExceptionRaised, ExcludedFunction, Finalization, FrameSnapshot, FunctionEntry, FunctionExit,
-    HashKind, Kwarg, LineDelta, Local, Metadata, NONE_VALUE_ID, Note, ProgramInfo, RecorderInfo,
-    RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, SourceFile, TraceReader, Value,
-    ValueEntry, ValueId, ValueTag,
+    AliasKind, Argument, BoundaryType, BranchResult, Change, Confidence, EXCEPTION_UNWIND_VALUE_ID,
+    Event, EventTag, ExceptionRaised, ExcludedFunction, Finalization, FrameSnapshot, FunctionEntry,
+    FunctionExit, HashKind, Kwarg, LineDelta, Local, Metadata, NONE_VALUE_ID, Note, ProgramInfo,
+    RecorderInfo, RecordingInfo, ScopeBoundary, ScopeConfig, ScopeResolution, SourceFile,
+    TraceReader, Value, ValueEntry, ValueId, ValueTag,
 };
 
 /// Maximum char count we keep from `repr(obj)` when summarizing arbitrary
@@ -368,6 +368,87 @@ impl PyTraceWriter {
         let w = self.inner_mut()?;
         let value = python_value_to_rust(w, value)?;
         Ok(w.intern_value_with_identity(value, hash))
+    }
+
+    /// Emit an "equivalent" alias: a fresh value_id whose content is declared
+    /// to match `aliased_value_id`. `confidence_str` is one of
+    /// "content_exact", "mutation_tracked", "dirty_reconciled",
+    /// "summary_observed", "uncertain_external".
+    ///
+    /// O(1). The recorder uses this when a container's summary fingerprint
+    /// matches the previous capture (length + endpoint identity unchanged).
+    fn intern_value_alias_equivalent(
+        &mut self,
+        aliased_value_id: u64,
+        confidence_str: &str,
+    ) -> PyResult<u64> {
+        let confidence = parse_confidence(confidence_str)?;
+        let w = self.inner_mut()?;
+        w.intern_value_alias(AliasKind::Equivalent, aliased_value_id, confidence)
+            .map_err(format_err)
+    }
+
+    /// Emit a "grown" alias: a fresh value_id representing the aliased
+    /// container with `new_elements` appended. For dicts, `new_elements` is a
+    /// flat list of alternating key, value, key, value... ids.
+    ///
+    /// O(k) in the number of new elements. The recorder uses this for
+    /// append-in-loop patterns: capture the new tail elements, alias the
+    /// rest.
+    fn intern_value_alias_grown(
+        &mut self,
+        aliased_value_id: u64,
+        new_elements: Vec<u64>,
+        confidence_str: &str,
+    ) -> PyResult<u64> {
+        let confidence = parse_confidence(confidence_str)?;
+        let w = self.inner_mut()?;
+        w.intern_value_alias(
+            AliasKind::Grown { new_elements },
+            aliased_value_id,
+            confidence,
+        )
+        .map_err(format_err)
+    }
+
+    /// Intern a Python container without re-walking it: takes a list of
+    /// pre-interned child value_ids and emits an inline list/set/dict.
+    ///
+    /// This is the bypass for the recorder's "I already have child ids
+    /// from per-element intern calls" path. Unlike `intern_value`, this
+    /// doesn't walk the Python object — the recorder is responsible for
+    /// passing the right child ids in order.
+    ///
+    /// `kind_str` selects the container shape:
+    /// - "list" or "tuple" → Value::List (tag 0x07)
+    /// - "set" or "frozenset" → Value::Set (tag 0x09)
+    /// - "dict" → Value::Dict (interpret children as alternating k,v pairs)
+    fn intern_value_container_from_children(
+        &mut self,
+        kind_str: &str,
+        children: Vec<u64>,
+    ) -> PyResult<u64> {
+        let w = self.inner_mut()?;
+        let value = match kind_str {
+            "list" | "tuple" => Value::List(children),
+            "set" | "frozenset" => Value::Set(children),
+            "dict" => {
+                if !children.len().is_multiple_of(2) {
+                    return Err(PyValueError::new_err(
+                        "dict requires an even-length children list (alternating k,v)",
+                    ));
+                }
+                let pairs: Vec<(u64, u64)> =
+                    children.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+                Value::Dict(pairs)
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown container kind {other:?}; expected list/tuple/set/frozenset/dict"
+                )));
+            }
+        };
+        Ok(w.intern_value_inline(value))
     }
 
     /// Write a FUNCTION_ENTRY event. `args` is an iterable of
@@ -740,6 +821,23 @@ fn format_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Parse a Python-side confidence string (the snake_case form used by the
+/// indexer's `confidence` column) into a Rust `Confidence` enum.
+fn parse_confidence(s: &str) -> PyResult<Confidence> {
+    match s {
+        "content_exact" => Ok(Confidence::ContentExact),
+        "mutation_tracked" => Ok(Confidence::MutationTracked),
+        "dirty_reconciled" => Ok(Confidence::DirtyReconciled),
+        "summary_observed" => Ok(Confidence::SummaryObserved),
+        "uncertain_external" => Ok(Confidence::UncertainExternal),
+        other => Err(PyValueError::new_err(format!(
+            "unknown confidence {other:?}; expected one of \
+             content_exact, mutation_tracked, dirty_reconciled, \
+             summary_observed, uncertain_external"
+        ))),
+    }
+}
+
 // --- Reader -----------------------------------------------------------------
 
 /// Read a `.hindsight` trace from disk and return its contents as a Python
@@ -910,6 +1008,26 @@ fn decode_value_entry(
             let d = PyDict::new(py);
             d.set_item("kind", "type_ref")?;
             d.set_item("type_name", &reader.strings()[*string_id as usize])?;
+            d.into_any().unbind()
+        }
+        Value::Alias {
+            kind,
+            aliased_value_id,
+            confidence,
+        } => {
+            let d = PyDict::new(py);
+            d.set_item("kind", "alias")?;
+            d.set_item("aliased_value_id", *aliased_value_id)?;
+            d.set_item("confidence", confidence.as_str())?;
+            match kind {
+                hindsight_format::AliasKind::Equivalent => {
+                    d.set_item("alias_kind", "equivalent")?;
+                }
+                hindsight_format::AliasKind::Grown { new_elements } => {
+                    d.set_item("alias_kind", "grown")?;
+                    d.set_item("new_elements", new_elements.clone())?;
+                }
+            }
             d.into_any().unbind()
         }
     };

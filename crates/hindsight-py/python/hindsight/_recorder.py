@@ -44,8 +44,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import _config
+from ._capture import ContainerCache, smart_intern_value
 from ._config import ScopeConfig
 from ._core import TraceWriter
+from ._mutation_tracking import (
+    METHOD_MUTATION_NAMES,
+    MutationOffsets,
+    install_mutation_events_for_code,
+    scan_mutation_offsets,
+)
 
 __all__ = ["record", "skip", "note"]
 
@@ -144,6 +151,7 @@ class _RecorderState:
         "_next_frame_id",
         "frame_info_by_pyframe",
         "last_value_id_by_local",
+        "container_cache_by_pyframe",
         "source_id_by_path",
         "skipped_files",
         "event_count",
@@ -153,6 +161,7 @@ class _RecorderState:
         "skip_blocks_observed",
         "depth_clips_observed",
         "opname_cache",
+        "mutation_offsets_by_code",
     )
 
     def __init__(
@@ -177,6 +186,10 @@ class _RecorderState:
         self._next_frame_id: int = 0
         self.frame_info_by_pyframe: dict[int, _FrameInfo] = {}
         self.last_value_id_by_local: dict[int, dict[str, int]] = {}
+        # Per-frame container alias cache. See ``_capture.ContainerCache``
+        # for what's stored. Created at PY_START for RECORDING frames,
+        # dropped at PY_RETURN/PY_UNWIND.
+        self.container_cache_by_pyframe: dict[int, ContainerCache] = {}
         self.source_id_by_path: dict[str, int] = {}
         self.skipped_files: set[str] = set()
         self.event_count: int = 0
@@ -192,6 +205,10 @@ class _RecorderState:
         # lazily on first BRANCH event for each code object.
         # Keyed by id(code) → {offset: opname}.
         self.opname_cache: dict[int, dict[int, str]] = {}
+        # Per-code static mutation analysis. Computed once at the first
+        # PY_START for each code object via ``scan_mutation_offsets``.
+        # Keyed by id(code).
+        self.mutation_offsets_by_code: dict[int, MutationOffsets] = {}
 
     def timestamp_delta_ns(self) -> int:
         now = time.perf_counter_ns()
@@ -539,6 +556,9 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
     """Code objects whose events the callbacks silently drop. Includes
     the wrapper closure, the callback functions, and helpers reached
     from them."""
+    from . import _capture as _capture_mod
+    from . import _mutation_tracking as _mut_mod
+
     funcs = (
         wrapper_code,
         record,
@@ -552,6 +572,9 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _on_line,
         _on_branch,
         _on_raise,
+        _on_instruction,
+        _on_call,
+        _mark_dirty_across_frame_caches,
         _opname_at,
         _monitored_event_kinds,
         _resolve_mode_for_new_frame,
@@ -562,6 +585,24 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
         _build_metadata,
         _safe_intern_value,
         note,
+        # _capture module helpers — they're called from inside the
+        # callbacks and could otherwise re-fire monitoring events on
+        # themselves.
+        _capture_mod.smart_intern_value,
+        _capture_mod._safe_intern,
+        _capture_mod._full_intern,
+        _capture_mod._emit_grown_list_alias,
+        _capture_mod._list_prefix_unchanged_likely,
+        _capture_mod._container_kind,
+        _capture_mod._last_element_pyid,
+        _capture_mod.ContainerCache.lookup,
+        _capture_mod.ContainerCache.remember,
+        _capture_mod.ContainerCache.mark_dirty,
+        _capture_mod.ContainerCache.mark_all_dirty,
+        _capture_mod.ContainerCache.__init__,
+        # _mutation_tracking module helpers.
+        _mut_mod.scan_mutation_offsets,
+        _mut_mod.install_mutation_events_for_code,
         _RecorderState.__init__,
         _RecorderState.timestamp_delta_ns,
         _RecorderState.alloc_frame_id,
@@ -584,7 +625,12 @@ def _build_skip_codes(wrapper_code: Any) -> frozenset:
 
 def _monitored_event_kinds() -> tuple:
     """The sys.monitoring event flags the recorder cares about. Defined
-    once so activate/deactivate stay in sync."""
+    once so activate/deactivate stay in sync.
+
+    Note: INSTRUCTION and CALL are subscribed *per-code-object* via
+    ``set_local_events`` rather than globally. They're not in this
+    tuple — they get registered separately at PY_START.
+    """
     e = sys.monitoring.events
     return (e.PY_START, e.PY_RETURN, e.PY_UNWIND, e.LINE, e.BRANCH, e.RAISE)
 
@@ -602,6 +648,11 @@ def _activate_monitoring() -> None:
     sys.monitoring.register_callback(_TOOL_ID, events.LINE, _on_line)
     sys.monitoring.register_callback(_TOOL_ID, events.BRANCH, _on_branch)
     sys.monitoring.register_callback(_TOOL_ID, events.RAISE, _on_raise)
+    # Mutation tracking (Stage 5): INSTRUCTION fires before the bytecode
+    # instruction executes, CALL fires before each Python-level call.
+    # Both are LOCAL — registered per-code-object at PY_START.
+    sys.monitoring.register_callback(_TOOL_ID, events.INSTRUCTION, _on_instruction)
+    sys.monitoring.register_callback(_TOOL_ID, events.CALL, _on_call)
     mask = 0
     for kind in _monitored_event_kinds():
         mask |= kind
@@ -618,6 +669,13 @@ def _deactivate_monitoring() -> None:
         try:
             sys.monitoring.register_callback(_TOOL_ID, ev, None)
         except (ValueError, RuntimeError):
+            pass
+    # Unregister mutation-tracking callbacks too.
+    for ev_attr in ("INSTRUCTION", "CALL"):
+        try:
+            ev = getattr(sys.monitoring.events, ev_attr)
+            sys.monitoring.register_callback(_TOOL_ID, ev, None)
+        except (ValueError, RuntimeError, AttributeError):
             pass
     try:
         sys.monitoring.free_tool_id(_TOOL_ID)
@@ -809,14 +867,28 @@ def _on_py_start(code: Any, instruction_offset: int) -> Any:
             info.frame_id = frame_id
             state.frame_info_by_pyframe[id(frame)] = info
             state.last_value_id_by_local[id(frame)] = {}
+            state.container_cache_by_pyframe[id(frame)] = ContainerCache()
             state.recorded_qualnames.add(qualname)
+
+            # Stage 5: install LOCAL INSTRUCTION + CALL events for the
+            # mutation tracker. Cache the static scan per code object so
+            # subsequent calls into the same function don't rescan.
+            code_key = id(code)
+            scan = state.mutation_offsets_by_code.get(code_key)
+            if scan is None:
+                try:
+                    scan = scan_mutation_offsets(code)
+                except Exception:
+                    scan = MutationOffsets(offsets=set(), container_locals={})
+                state.mutation_offsets_by_code[code_key] = scan
+            install_mutation_events_for_code(_TOOL_ID, code, scan)
 
             # Per the trace format spec: function_id references the
             # *fully* qualified name (module-prefixed), not just
             # ``code.co_qualname``. The AI consumer needs the module to
             # disambiguate top-level functions across files.
             function_id = state.writer.intern_string(qualname)
-            args = _capture_args(state, code, frame)
+            args = _capture_args(state, code, frame, state.container_cache_by_pyframe[id(frame)])
 
             delta = state.timestamp_delta_ns()
             state.writer.write_function_entry(
@@ -830,9 +902,10 @@ def _on_py_start(code: Any, instruction_offset: int) -> Any:
             state.event_count += 1
 
             last = state.last_value_id_by_local[id(frame)]
+            cache = state.container_cache_by_pyframe[id(frame)]
             snapshot_locals: list[tuple[int, int]] = []
             for name, value in frame.f_locals.items():
-                value_id = _safe_intern_value(state, value)
+                value_id = smart_intern_value(state.writer, cache, value)
                 if value_id is None:
                     continue
                 name_id = state.writer.intern_string(name)
@@ -900,8 +973,10 @@ def _on_py_return(code: Any, instruction_offset: int, retval: Any) -> Any:
             # before our state existed). Ensure the locals map doesn't
             # leak.
             state.last_value_id_by_local.pop(frame_key, None)
+            state.container_cache_by_pyframe.pop(frame_key, None)
             return
         state.last_value_id_by_local.pop(frame_key, None)
+        state.container_cache_by_pyframe.pop(frame_key, None)
 
         if info.mode == _MODE_RECORDING:
             return_value_id = _safe_intern_value(state, retval)
@@ -968,7 +1043,8 @@ def _on_line(code: Any, line_number: int) -> Any:
             # via the resolution rules in `_resolve_mode_for_new_frame`.
             return
         last = state.last_value_id_by_local[frame_key]
-        changes = _capture_locals_into_changes(state, frame, last)
+        cache = state.container_cache_by_pyframe[frame_key]
+        changes = _capture_locals_into_changes(state, frame, last, cache)
         delta = state.timestamp_delta_ns()
         state.writer.write_line_delta(
             timestamp_delta_ns=delta,
@@ -1004,8 +1080,10 @@ def _on_py_unwind(code: Any, instruction_offset: int, exception: BaseException) 
         info = state.frame_info_by_pyframe.pop(frame_key, None)
         if info is None:
             state.last_value_id_by_local.pop(frame_key, None)
+            state.container_cache_by_pyframe.pop(frame_key, None)
             return
         state.last_value_id_by_local.pop(frame_key, None)
+        state.container_cache_by_pyframe.pop(frame_key, None)
 
         if info.mode == _MODE_RECORDING:
             delta = state.timestamp_delta_ns()
@@ -1153,6 +1231,100 @@ def _on_raise(code: Any, instruction_offset: int, exception: BaseException) -> A
         _in_callback = False
 
 
+# --- Mutation tracking callbacks (Stage 5) ----------------------------------
+
+
+def _on_instruction(code: Any, instruction_offset: int) -> Any:
+    """INSTRUCTION callback. Local-scoped per-code-object so the recorder
+    doesn't pay for every instruction in every Python frame.
+
+    Returns ``DISABLE`` for offsets that aren't mutation opcodes — that
+    permanently silences the event for that exact (code, offset) pair
+    until the tool is reset. Steady-state cost is one callback per
+    *executed* mutation opcode, not per executed instruction.
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback or code in state.skip_codes:
+        return None
+    scan = state.mutation_offsets_by_code.get(id(code))
+    if scan is None or not scan.is_mutation_offset(instruction_offset):
+        # Not a mutation opcode at this offset — silence permanently.
+        return sys.monitoring.DISABLE
+    _in_callback = True
+    try:
+        # Find the active container cache. The mutation may target a
+        # container that lives in this frame's cache OR in an ancestor
+        # frame's cache (e.g., a list passed in by the caller). We mark
+        # dirty in whichever cache holds it.
+        try:
+            frame = sys._getframe(1)
+        except ValueError:
+            return None
+        local_name = scan.container_local_at(instruction_offset)
+        if local_name is not None:
+            target = frame.f_locals.get(local_name)
+            if target is not None:
+                _mark_dirty_across_frame_caches(state, id(target))
+            return None
+        # Couldn't statically pin the container. Coarse fallback: mark
+        # every cached container in the firing frame dirty. Producing
+        # false positives just means an extra re-walk; correctness is
+        # preserved.
+        cache = state.container_cache_by_pyframe.get(id(frame))
+        if cache is not None:
+            cache.mark_all_dirty()
+    finally:
+        _in_callback = False
+    return None
+
+
+def _on_call(
+    code: Any,
+    instruction_offset: int,
+    callable_obj: Any,
+    arg0: Any,
+) -> Any:
+    """CALL callback. Fires before each Python-level call; ``arg0`` is
+    the first argument (the receiver for bound method calls).
+
+    Strategy: if ``callable_obj`` is a bound method whose name is in
+    ``METHOD_MUTATION_NAMES`` and ``arg0`` is a tracked container, mark
+    that container dirty. False positives (e.g., ``lst.copy()`` would
+    not actually mutate but its name isn't in the list, so this is
+    fine) cost only an unnecessary re-walk; false negatives are not
+    possible for the listed methods.
+    """
+    global _in_callback
+    state = _state
+    if state is None or _in_callback or code in state.skip_codes:
+        return None
+    method_name = getattr(callable_obj, "__name__", None)
+    if method_name not in METHOD_MUTATION_NAMES:
+        return None
+    if arg0 is None:
+        return None
+    _in_callback = True
+    try:
+        _mark_dirty_across_frame_caches(state, id(arg0))
+    finally:
+        _in_callback = False
+    return None
+
+
+def _mark_dirty_across_frame_caches(state: _RecorderState, py_id: int) -> None:
+    """Mark a container dirty in every frame cache that holds it.
+
+    The same Python id may live in multiple frame caches if a container
+    was passed from caller to callee — both the caller's and callee's
+    cache reference the same id. Marking all of them ensures any frame
+    that re-captures the container after a mutation correctly upgrades
+    to ``dirty_reconciled``.
+    """
+    for cache in state.container_cache_by_pyframe.values():
+        cache.mark_dirty(py_id)
+
+
 def _opname_at(state: _RecorderState, code: Any, offset: int) -> str:
     """Return the opcode name at ``offset`` in ``code``, cached per
     code object on the state. Returns ``"UNKNOWN"`` if no instruction
@@ -1168,10 +1340,19 @@ def _opname_at(state: _RecorderState, code: Any, offset: int) -> str:
 # --- Capture helpers --------------------------------------------------------
 
 
-def _capture_args(state: _RecorderState, code: Any, frame: Any) -> list[tuple[int, int]]:
+def _capture_args(
+    state: _RecorderState,
+    code: Any,
+    frame: Any,
+    cache: ContainerCache,
+) -> list[tuple[int, int]]:
     """Pull the function's parameters out of ``frame.f_locals`` for the
     FUNCTION_ENTRY ``args`` list. Covers positional, keyword-only,
-    ``*args``, and ``**kwargs`` slots."""
+    ``*args``, and ``**kwargs`` slots.
+
+    Goes through ``smart_intern_value`` so containers passed as
+    arguments populate the per-frame alias cache from the start.
+    """
     co_argcount = code.co_argcount
     co_kwonly = code.co_kwonlyargcount
     var_names = code.co_varnames
@@ -1192,7 +1373,7 @@ def _capture_args(state: _RecorderState, code: Any, frame: Any) -> list[tuple[in
         name = var_names[idx]
         if name not in locs:
             continue
-        value_id = _safe_intern_value(state, locs[name])
+        value_id = smart_intern_value(state.writer, cache, locs[name])
         if value_id is None:
             continue
         name_id = state.writer.intern_string(name)
@@ -1201,12 +1382,18 @@ def _capture_args(state: _RecorderState, code: Any, frame: Any) -> list[tuple[in
 
 
 def _capture_locals_into_changes(
-    state: _RecorderState, frame: Any, last: dict[str, int]
+    state: _RecorderState,
+    frame: Any,
+    last: dict[str, int],
+    cache: ContainerCache,
 ) -> list[tuple[int, int]]:
-    """Diff the current ``f_locals`` against ``last`` and return changes."""
+    """Diff the current ``f_locals`` against ``last`` and return changes.
+
+    Goes through ``smart_intern_value`` for the alias fast-path on
+    containers that were captured before."""
     changes: list[tuple[int, int]] = []
     for name, value in frame.f_locals.items():
-        value_id = _safe_intern_value(state, value)
+        value_id = smart_intern_value(state.writer, cache, value)
         if value_id is None:
             continue
         if last.get(name) == value_id:

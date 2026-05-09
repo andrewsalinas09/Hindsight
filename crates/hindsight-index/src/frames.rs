@@ -259,6 +259,16 @@ fn short_value_repr(values: &[ValueEntry], id: u64, strings: &[String]) -> Strin
             .map(|s| format!("<type {s}>"))
             .unwrap_or_else(|| "<type ?>".to_string()),
         hindsight_format::Value::ExceptionUnwindSentinel => "<unwound>".to_string(),
+        hindsight_format::Value::Alias {
+            aliased_value_id, ..
+        } => {
+            // Recurse one level to render the aliased value. Long alias
+            // chains terminate naturally because the source's tag eventually
+            // bottoms out. We bound the recursion implicitly via the values
+            // slice — a malformed cycle would cycle forever, but the
+            // writer's no-forward-refs invariant prevents that.
+            short_value_repr(values, *aliased_value_id, strings)
+        }
     }
 }
 
