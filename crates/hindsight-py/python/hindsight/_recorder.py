@@ -199,7 +199,14 @@ class _RecorderState:
         # Resolved-scope tallies, drained into the trace's final summary
         # at finalization.
         self.recorded_qualnames: set[str] = set()
-        self.excluded_records: list[tuple[str, str]] = []
+        # qualname → first matching exclude pattern. Deduped because the
+        # same excluded function may be entered many times in one
+        # recording (e.g., ``numpy.mean`` called per-iteration); the
+        # final summary only needs each qualname once. First-pattern-wins
+        # is sufficient — the resolver picks the first match anyway, so
+        # later "matches" of the same qualname would always pick the
+        # same pattern.
+        self.excluded_records: dict[str, str] = {}
         self.skip_blocks_observed: int = 0
         self.depth_clips_observed: int = 0
         # Per-code opcode lookup cache used by the BRANCH callback to
@@ -696,7 +703,9 @@ def _finalize(state: _RecorderState) -> None:
     end_ns = time.time_ns()
     scope_resolution = {
         "recorded_functions": sorted(state.recorded_qualnames),
-        "excluded_functions": list(state.excluded_records),
+        "excluded_functions": [
+            (q, p) for q, p in sorted(state.excluded_records.items())
+        ],
         "skip_blocks_observed": state.skip_blocks_observed,
         "depth_clips_observed": state.depth_clips_observed,
     }
@@ -941,7 +950,11 @@ def _on_py_start(code: Any, instruction_offset: int) -> Any:
             state.event_count += 1
             info.boundary_emitted_at_enter = True
             state.frame_info_by_pyframe[id(frame)] = info
-            state.excluded_records.append((qualname, pattern or ""))
+            # First-write-wins: the resolver returns the first matching
+            # pattern, and re-checking on later calls of the same
+            # qualname returns the same pattern, so dict.setdefault is
+            # both correct and a touch faster than checking membership.
+            state.excluded_records.setdefault(qualname, pattern or "")
             return
 
         if mode == _MODE_DEPTH_CLIPPED:

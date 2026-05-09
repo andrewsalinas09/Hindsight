@@ -466,13 +466,21 @@ fn insert_metadata(conn: &Connection, reader: &TraceReader) -> Result<()> {
     )?;
 
     if let Some(fs) = &final_summary {
-        let mut rec_stmt =
-            conn.prepare("INSERT INTO recorded_functions (qualified_name) VALUES (?)")?;
+        // ON CONFLICT DO NOTHING tolerates legacy v0.3 traces where the
+        // recorder didn't dedupe before writing the final summary —
+        // those listed an excluded function once per call site, which
+        // would violate the qualified_name PRIMARY KEY. v0.4+ recorders
+        // dedupe before emit, so this guard is a no-op for fresh traces.
+        let mut rec_stmt = conn.prepare(
+            "INSERT INTO recorded_functions (qualified_name) VALUES (?) \
+             ON CONFLICT DO NOTHING",
+        )?;
         for q in &fs.r#final.scope_resolved.recorded_functions {
             rec_stmt.execute(params![q])?;
         }
         let mut excl_stmt = conn.prepare(
-            "INSERT INTO excluded_functions (qualified_name, matched_pattern) VALUES (?, ?)",
+            "INSERT INTO excluded_functions (qualified_name, matched_pattern) \
+             VALUES (?, ?) ON CONFLICT DO NOTHING",
         )?;
         for ef in &fs.r#final.scope_resolved.excluded_functions {
             excl_stmt.execute(params![ef.name, ef.matched_pattern])?;
